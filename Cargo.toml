@@ -1,0 +1,20 @@
+[package]
+name = "svc-authz"
+version = "0.1.0"
+authors = ["Andrei Nesterov <ae.nesterov@gmail.com>"]
+description = "An authorization library."
+readme = "README.md"
+keywords = ["authorization", "authz", "middleware"]
+categories = ["authentication", "web-programming"]
+repository = "https://github.com/netology-group/svc-authz-rs"
+license = "MIT"
+edition = "2018"
+
+[dependencies]
+failure = "0.1"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
+jsonwebtoken = "5.0"
+reqwest = "0.9"
+svc-authn = { version = "0.1.0", features = ["jose"] }
