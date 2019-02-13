@@ -9,7 +9,7 @@ use svc_authn::{token::jws_compact, AccountId};
 
 pub type ConfigMap = HashMap<String, Config>;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum Config {
@@ -41,7 +41,9 @@ impl Clone for Client {
 }
 
 trait IntoClient {
-    fn into_client(self, me: &dyn Authenticable, audience: &str) -> Result<Client, Error>;
+    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, Error>
+    where
+        A: Authenticable;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -53,7 +55,10 @@ pub struct ClientMap {
 }
 
 impl ClientMap {
-    pub fn new(me: &dyn Authenticable, m: ConfigMap) -> Result<Self, Error> {
+    pub fn new<A>(me: &A, m: ConfigMap) -> Result<Self, Error>
+    where
+        A: Authenticable,
+    {
         let mut inner: HashMap<String, Client> = HashMap::new();
         for (audience, config) in m {
             match config {
@@ -69,18 +74,21 @@ impl ClientMap {
         }
 
         Ok(Self {
-            object_ns: me.account_id().to_string(),
+            object_ns: me.as_account_id().to_string(),
             inner,
         })
     }
 
-    pub fn authorize(
+    pub fn authorize<A>(
         &self,
         audience: &str,
-        subject: &dyn Authenticable,
+        subject: &A,
         object: Vec<&str>,
         action: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), Error>
+    where
+        A: Authenticable,
+    {
         let client = self
             .inner
             .get(audience)
@@ -88,8 +96,8 @@ impl ClientMap {
 
         let intent = Intent::new(
             Entity::new(
-                subject.account_id().audience(),
-                vec!["accounts", subject.account_id().label()],
+                subject.as_account_id().audience(),
+                vec!["accounts", subject.as_account_id().label()],
             ),
             Entity::new(&self.object_ns, object),
             action,
@@ -138,11 +146,14 @@ impl<'a> Entity<'a> {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TrustedConfig {}
 
 impl IntoClient for TrustedConfig {
-    fn into_client(self, _me: &dyn Authenticable, _audience: &str) -> Result<Client, Error> {
+    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, Error>
+    where
+        A: Authenticable,
+    {
         Ok(Box::new(TrustedClient {}))
     }
 }
@@ -162,7 +173,7 @@ impl Authorize for TrustedClient {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HttpConfig {
     uri: String,
     #[serde(deserialize_with = "crate::serde::algorithm")]
@@ -186,17 +197,20 @@ impl HttpConfig {
 }
 
 impl IntoClient for HttpConfig {
-    fn into_client(self, me: &dyn Authenticable, audience: &str) -> Result<Client, Error> {
-        let issuer = me.account_id().audience();
+    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, Error>
+    where
+        A: Authenticable,
+    {
+        let issuer = me.as_account_id().audience();
         let mapped_me = AccountId::new(
-            me.account_id().label(),
-            &format!("{}:{}", me.account_id().audience(), audience),
+            me.as_account_id().label(),
+            &format!("{}:{}", me.as_account_id().audience(), audience),
         );
 
         let token = jws_compact::TokenBuilder::new()
             .issuer(issuer)
             .subject(&mapped_me)
-            .key(&self.algorithm, &self.key)
+            .key(self.algorithm, &self.key)
             .build()
             .map_err(|err| {
                 format_err!(
