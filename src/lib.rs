@@ -13,7 +13,7 @@ pub type ConfigMap = HashMap<String, Config>;
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum Config {
-    Trusted(TrustedConfig),
+    None(NoneConfig),
     Http(HttpConfig),
 }
 
@@ -62,7 +62,7 @@ impl ClientMap {
         let mut inner: HashMap<String, Client> = HashMap::new();
         for (audience, config) in m {
             match config {
-                Config::Trusted(config) => {
+                Config::None(config) => {
                     let client = config.into_client(me, &audience)?;
                     inner.insert(audience, client);
                 }
@@ -147,21 +147,21 @@ impl<'a> Entity<'a> {
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TrustedConfig {}
+pub struct NoneConfig {}
 
-impl IntoClient for TrustedConfig {
+impl IntoClient for NoneConfig {
     fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, Error>
     where
         A: Authenticable,
     {
-        Ok(Box::new(TrustedClient {}))
+        Ok(Box::new(NoneClient {}))
     }
 }
 
 #[derive(Debug, Clone)]
-struct TrustedClient {}
+struct NoneClient {}
 
-impl Authorize for TrustedClient {
+impl Authorize for NoneClient {
     fn authorize(&self, _intent: &Intent) -> Result<(), Error> {
         Ok(())
     }
