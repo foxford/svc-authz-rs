@@ -14,6 +14,7 @@ pub type ConfigMap = HashMap<String, Config>;
 #[serde(rename_all = "lowercase")]
 pub enum Config {
     None(NoneConfig),
+    Local(LocalConfig),
     Http(HttpConfig),
 }
 
@@ -63,6 +64,10 @@ impl ClientMap {
         for (audience, config) in m {
             match config {
                 Config::None(config) => {
+                    let client = config.into_client(me, &audience)?;
+                    inner.insert(audience, client);
+                }
+                Config::Local(config) => {
                     let client = config.into_client(me, &audience)?;
                     inner.insert(audience, client);
                 }
@@ -159,6 +164,45 @@ struct NoneClient {}
 impl Authorize for NoneClient {
     fn authorize(&self, _subject: &AccountId, _object: Entity, _action: &str) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn box_clone(&self) -> Box<dyn Authorize> {
+        Box::new(self.clone())
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalConfig {
+    #[serde(default)]
+    trusted: HashSet<AccountId>,
+}
+
+impl IntoClient for LocalConfig {
+    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, Error>
+    where
+        A: Authenticable,
+    {
+        Ok(Box::new(LocalClient {
+            trusted: self.trusted,
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalClient {
+    trusted: HashSet<AccountId>,
+}
+
+impl Authorize for LocalClient {
+    fn authorize(&self, subject: &AccountId, _object: Entity, _action: &str) -> Result<(), Error> {
+        // Allow access if the subject in the trusted list
+        if let true = self.trusted.contains(subject) {
+            return Ok(());
+        }
+
+        Err(format_err!("subject = '{}' isn't trusted", &subject))
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
