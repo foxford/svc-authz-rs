@@ -1,7 +1,7 @@
 use failure::{format_err, Error};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use svc_authn::{token::jws_compact, AccountId};
 
@@ -20,7 +20,7 @@ pub enum Config {
 ////////////////////////////////////////////////////////////////////////////////
 
 trait Authorize: Sync + Send {
-    fn authorize(&self, intent: &Intent) -> Result<(), Error>;
+    fn authorize(&self, subject: &AccountId, object: Entity, action: &str) -> Result<(), Error>;
     fn box_clone(&self) -> Box<dyn Authorize>;
 }
 
@@ -94,16 +94,11 @@ impl ClientMap {
             .get(audience)
             .ok_or_else(|| format_err!("no authz configuration for the audience = {}", audience))?;
 
-        let intent = Intent::new(
-            Entity::new(
-                subject.as_account_id().audience(),
-                vec!["accounts", subject.as_account_id().label()],
-            ),
+        client.authorize(
+            subject.as_account_id(),
             Entity::new(&self.object_ns, object),
             action,
-        );
-
-        client.authorize(&intent)
+        )
     }
 }
 
@@ -162,7 +157,7 @@ impl IntoClient for NoneConfig {
 struct NoneClient {}
 
 impl Authorize for NoneClient {
-    fn authorize(&self, _intent: &Intent) -> Result<(), Error> {
+    fn authorize(&self, _subject: &AccountId, _object: Entity, _action: &str) -> Result<(), Error> {
         Ok(())
     }
 
@@ -176,6 +171,8 @@ impl Authorize for NoneClient {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpConfig {
     uri: String,
+    #[serde(default)]
+    trusted: HashSet<AccountId>,
     #[serde(deserialize_with = "crate::serde::algorithm")]
     algorithm: Algorithm,
     #[serde(deserialize_with = "crate::serde::file")]
@@ -222,6 +219,7 @@ impl IntoClient for HttpConfig {
 
         Ok(Box::new(HttpClient {
             uri: self.uri,
+            trusted: self.trusted,
             token,
         }))
     }
@@ -230,18 +228,30 @@ impl IntoClient for HttpConfig {
 #[derive(Debug, Clone)]
 struct HttpClient {
     uri: String,
+    trusted: HashSet<AccountId>,
     token: String,
 }
 
 impl Authorize for HttpClient {
-    fn authorize(&self, intent: &Intent) -> Result<(), Error> {
+    fn authorize(&self, subject: &AccountId, object: Entity, action: &str) -> Result<(), Error> {
         use reqwest;
+
+        // Allow access if the subject in the trusted list
+        if let true = self.trusted.contains(subject) {
+            return Ok(());
+        }
+
+        let intent = Intent::new(
+            Entity::new(subject.audience(), vec!["accounts", subject.label()]),
+            object,
+            action,
+        );
 
         let client = reqwest::Client::new();
         let resp: Vec<String> = client
             .post(&self.uri)
             .bearer_auth(&self.token)
-            .json(intent)
+            .json(&intent)
             .send()
             .map_err(|err| format_err!("error sending the authorization request, {}", &err))?
             .json()
