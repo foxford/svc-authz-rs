@@ -217,9 +217,9 @@ pub struct HttpConfig {
     uri: String,
     #[serde(default)]
     trusted: HashSet<AccountId>,
-    #[serde(deserialize_with = "crate::serde::algorithm")]
+    #[serde(deserialize_with = "svc_authn::serde::algorithm")]
     algorithm: Algorithm,
-    #[serde(deserialize_with = "crate::serde::file")]
+    #[serde(deserialize_with = "svc_authn::serde::file")]
     key: Vec<u8>,
 }
 
@@ -321,5 +321,3 @@ impl Authorize for HttpClient {
 ////////////////////////////////////////////////////////////////////////////////
 
 pub use svc_authn::Authenticable;
-
-pub(crate) mod serde;
