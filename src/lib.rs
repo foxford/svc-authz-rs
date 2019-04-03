@@ -1,9 +1,11 @@
-use failure::{format_err, Error};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use svc_authn::{token::jws_compact, AccountId};
+
+use crate::error::{ConfigurationError, IntentError};
+use crate::intent::Intent;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -21,7 +23,7 @@ pub enum Config {
 ////////////////////////////////////////////////////////////////////////////////
 
 trait Authorize: Sync + Send {
-    fn authorize(&self, subject: &AccountId, object: Entity, action: &str) -> Result<(), Error>;
+    fn authorize(&self, subject: &AccountId, object: Vec<&str>, action: &str) -> Result<(), Error>;
     fn box_clone(&self) -> Box<dyn Authorize>;
 }
 
@@ -42,7 +44,7 @@ impl Clone for Client {
 }
 
 trait IntoClient {
-    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, Error>
+    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, ConfigurationError>
     where
         A: Authenticable;
 }
@@ -51,12 +53,11 @@ trait IntoClient {
 
 #[derive(Clone, Debug)]
 pub struct ClientMap {
-    object_ns: String,
     inner: HashMap<String, Client>,
 }
 
 impl ClientMap {
-    pub fn new<A>(me: &A, m: ConfigMap) -> Result<Self, Error>
+    pub fn new<A>(me: &A, m: ConfigMap) -> Result<Self, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -78,10 +79,7 @@ impl ClientMap {
             }
         }
 
-        Ok(Self {
-            object_ns: me.as_account_id().to_string(),
-            inner,
-        })
+        Ok(Self { inner })
     }
 
     pub fn authorize<A>(
@@ -94,53 +92,21 @@ impl ClientMap {
     where
         A: Authenticable,
     {
-        let client = self
-            .inner
-            .get(audience)
-            .ok_or_else(|| format_err!("no authz configuration for the audience = {}", audience))?;
+        let client = self.inner.get(audience).ok_or_else(|| {
+            ErrorKind::Forbidden(IntentError::new(
+                Intent::new(
+                    subject.as_account_id().clone(),
+                    object.iter().map(|&s| s.into()).collect(),
+                    action,
+                ),
+                &format!(
+                    "no authorization configuration for the audience = {}",
+                    audience
+                ),
+            ))
+        })?;
 
-        client.authorize(
-            subject.as_account_id(),
-            Entity::new(&self.object_ns, object),
-            action,
-        )
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-#[derive(Debug, Serialize)]
-struct Intent<'a> {
-    subject: Entity<'a>,
-    object: Entity<'a>,
-    action: &'a str,
-}
-
-impl<'a> Intent<'a> {
-    fn new(subject: Entity<'a>, object: Entity<'a>, action: &'a str) -> Self {
-        Self {
-            subject,
-            object,
-            action,
-        }
-    }
-
-    fn action(&self) -> &str {
-        self.action
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-#[derive(Debug, Serialize)]
-struct Entity<'a> {
-    namespace: &'a str,
-    value: Vec<&'a str>,
-}
-
-impl<'a> Entity<'a> {
-    fn new(namespace: &'a str, value: Vec<&'a str>) -> Self {
-        Self { namespace, value }
+        client.authorize(subject.as_account_id(), object, action)
     }
 }
 
@@ -150,7 +116,7 @@ impl<'a> Entity<'a> {
 pub struct NoneConfig {}
 
 impl IntoClient for NoneConfig {
-    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, Error>
+    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -162,7 +128,12 @@ impl IntoClient for NoneConfig {
 struct NoneClient {}
 
 impl Authorize for NoneClient {
-    fn authorize(&self, _subject: &AccountId, _object: Entity, _action: &str) -> Result<(), Error> {
+    fn authorize(
+        &self,
+        _subject: &AccountId,
+        _object: Vec<&str>,
+        _action: &str,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
@@ -180,7 +151,7 @@ pub struct LocalConfig {
 }
 
 impl IntoClient for LocalConfig {
-    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, Error>
+    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -196,13 +167,21 @@ struct LocalClient {
 }
 
 impl Authorize for LocalClient {
-    fn authorize(&self, subject: &AccountId, _object: Entity, _action: &str) -> Result<(), Error> {
+    fn authorize(&self, subject: &AccountId, object: Vec<&str>, action: &str) -> Result<(), Error> {
         // Allow access if the subject in the trusted list
         if let true = self.trusted.contains(subject) {
             return Ok(());
         }
 
-        Err(format_err!("subject = '{}' isn't trusted", &subject))
+        Err(ErrorKind::Forbidden(IntentError::new(
+            Intent::new(
+                subject.clone(),
+                object.iter().map(|&s| s.into()).collect(),
+                action,
+            ),
+            "the subject isn't in a trusted list",
+        ))
+        .into())
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
@@ -238,7 +217,7 @@ impl HttpConfig {
 }
 
 impl IntoClient for HttpConfig {
-    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, Error>
+    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -254,14 +233,14 @@ impl IntoClient for HttpConfig {
             .key(self.algorithm, &self.key)
             .build()
             .map_err(|err| {
-                format_err!(
-                    "error converting authz config for audience = '{}' into client – {}",
-                    audience,
-                    &err,
-                )
+                ConfigurationError::new(&format!(
+                    "error converting an authorization config for audience = '{}' into client, {}",
+                    audience, &err,
+                ))
             })?;
 
         Ok(Box::new(HttpClient {
+            object_ns: me.as_account_id().to_string(),
             uri: self.uri,
             trusted: self.trusted,
             token,
@@ -271,23 +250,22 @@ impl IntoClient for HttpConfig {
 
 #[derive(Debug, Clone)]
 struct HttpClient {
+    object_ns: String,
     uri: String,
     trusted: HashSet<AccountId>,
     token: String,
 }
 
 impl Authorize for HttpClient {
-    fn authorize(&self, subject: &AccountId, object: Entity, action: &str) -> Result<(), Error> {
-        use reqwest;
-
+    fn authorize(&self, subject: &AccountId, object: Vec<&str>, action: &str) -> Result<(), Error> {
         // Allow access if the subject in the trusted list
         if let true = self.trusted.contains(subject) {
             return Ok(());
         }
 
-        let intent = Intent::new(
-            Entity::new(subject.audience(), vec!["accounts", subject.label()]),
-            object,
+        let payload = HttpRequest::new(
+            HttpRequestEntity::new(subject.audience(), vec!["accounts", subject.label()]),
+            HttpRequestEntity::new(&self.object_ns, object.clone()),
             action,
         );
 
@@ -295,19 +273,44 @@ impl Authorize for HttpClient {
         let resp: Vec<String> = client
             .post(&self.uri)
             .bearer_auth(&self.token)
-            .json(&intent)
+            .json(&payload)
             .send()
-            .map_err(|err| format_err!("error sending the authorization request, {}", &err))?
+            .map_err(|e| {
+                ErrorKind::Network(IntentError::new(
+                    Intent::new(
+                        subject.clone(),
+                        object.iter().map(|&s| s.into()).collect(),
+                        action,
+                    ),
+                    &format!("error sending the authorization request, {}", &e),
+                ))
+            })?
             .json()
             .map_err(|_| {
-                format_err!(
-                    "invalid format of the authorization response, intent = '{}'",
-                    serde_json::to_string(&intent).unwrap_or_else(|_| format!("{:?}", &intent)),
-                )
+                ErrorKind::Network(IntentError::new(
+                    Intent::new(
+                        subject.clone(),
+                        object.iter().map(|&s| s.into()).collect(),
+                        action,
+                    ),
+                    &format!(
+                        "invalid format of the authorization response on the request = '{}'",
+                        serde_json::to_string(&payload)
+                            .unwrap_or_else(|_| format!("{:?}", &payload))
+                    ),
+                ))
             })?;
 
-        if !resp.contains(&intent.action().to_owned()) {
-            return Err(format_err!("action = {} is not allowed", &intent.action()));
+        if !resp.contains(&action.to_owned()) {
+            return Err(ErrorKind::Forbidden(IntentError::new(
+                Intent::new(
+                    subject.clone(),
+                    object.iter().map(|&s| s.into()).collect(),
+                    action,
+                ),
+                "the action forbidden by tenant",
+            ))
+            .into());
         }
 
         Ok(())
@@ -318,6 +321,39 @@ impl Authorize for HttpClient {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct HttpRequest<'a> {
+    subject: HttpRequestEntity<'a>,
+    object: HttpRequestEntity<'a>,
+    action: &'a str,
+}
+
+impl<'a> HttpRequest<'a> {
+    fn new(subject: HttpRequestEntity<'a>, object: HttpRequestEntity<'a>, action: &'a str) -> Self {
+        Self {
+            subject,
+            object,
+            action,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HttpRequestEntity<'a> {
+    namespace: &'a str,
+    value: Vec<&'a str>,
+}
+
+impl<'a> HttpRequestEntity<'a> {
+    fn new(namespace: &'a str, value: Vec<&'a str>) -> Self {
+        Self { namespace, value }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 pub use svc_authn::Authenticable;
+
+pub use self::error::{Error, Kind as ErrorKind};
+pub mod error;
+pub mod intent;
