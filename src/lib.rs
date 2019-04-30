@@ -2,6 +2,7 @@ use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::Duration;
 use svc_authn::{token::jws_compact, AccountId};
 
 use crate::error::{ConfigurationError, IntentError};
@@ -200,6 +201,7 @@ pub struct HttpConfig {
     algorithm: Algorithm,
     #[serde(deserialize_with = "svc_authn::serde::file")]
     key: Vec<u8>,
+    timeout: Option<u64>,
 }
 
 impl HttpConfig {
@@ -242,6 +244,7 @@ impl IntoClient for HttpConfig {
         Ok(Box::new(HttpClient {
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
+            timeout: Duration::from_secs(self.timeout.unwrap_or(5)),
             trusted: self.trusted,
             token,
         }))
@@ -252,6 +255,7 @@ impl IntoClient for HttpConfig {
 struct HttpClient {
     object_ns: String,
     uri: String,
+    timeout: Duration,
     trusted: HashSet<AccountId>,
     token: String,
 }
@@ -269,7 +273,20 @@ impl Authorize for HttpClient {
             action,
         );
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .build()
+            .map_err(|e| {
+                ErrorKind::Network(IntentError::new(
+                    Intent::new(
+                        subject.clone(),
+                        object.iter().map(|&s| s.into()).collect(),
+                        action,
+                    ),
+                    &format!("error initializing HTTP client, {}", &e),
+                ))
+            })?;
+
         let resp: Vec<String> = client
             .post(&self.uri)
             .bearer_auth(&self.token)
