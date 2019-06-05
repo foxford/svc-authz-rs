@@ -17,6 +17,6 @@ travis-ci = { repository = "netology-group/svc-authz-rs" }
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
-jsonwebtoken = "5.0"
+jsonwebtoken = "6.0"
 reqwest = "0.9"
-svc-authn = { version = "0.4", features = ["jose"] }
+svc-authn = { version = "0.5", features = ["jose"] }
