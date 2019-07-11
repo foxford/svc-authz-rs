@@ -18,6 +18,10 @@ impl Intent {
             action: action.to_owned(),
         }
     }
+
+    pub(crate) fn action(&self) -> &str {
+        &self.action
+    }
 }
 
 impl fmt::Display for Intent {
