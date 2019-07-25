@@ -4,7 +4,7 @@ use svc_authn::AccountId;
 ////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug)]
-pub(crate) struct Intent {
+pub struct Intent {
     subject: AccountId,
     object: Vec<String>,
     action: String,
@@ -28,10 +28,10 @@ impl fmt::Display for Intent {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(
             &format!(
-                "action = '{}' to the object = '{}' for the subject = '{}'",
-                &self.action,
-                &self.object.join("."),
+                "intent::{}::{}::{}",
                 self.subject,
+                &self.object.join("/"),
+                &self.action,
             ),
             fmt,
         )

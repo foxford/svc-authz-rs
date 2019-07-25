@@ -6,6 +6,7 @@ use std::fmt;
 use std::time::Duration;
 use svc_authn::{token::jws_compact, AccountId};
 
+use crate::cache::{Cache, Response as CacheResponse};
 use crate::error::{ConfigurationError, IntentError};
 use crate::intent::Intent;
 
@@ -51,7 +52,12 @@ impl Clone for Client {
 }
 
 trait IntoClient {
-    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, ConfigurationError>
+    fn into_client<A>(
+        self,
+        me: &A,
+        cache: Option<Cache>,
+        audience: &str,
+    ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable;
 }
@@ -64,7 +70,7 @@ pub struct ClientMap {
 }
 
 impl ClientMap {
-    pub fn new<A>(me: &A, m: ConfigMap) -> Result<Self, ConfigurationError>
+    pub fn new<A>(me: &A, cache: Option<Cache>, m: ConfigMap) -> Result<Self, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -72,15 +78,15 @@ impl ClientMap {
         for (audience, config) in m {
             match config {
                 Config::None(config) => {
-                    let client = config.into_client(me, &audience)?;
+                    let client = config.into_client(me, cache.clone(), &audience)?;
                     inner.insert(audience, client);
                 }
                 Config::Local(config) => {
-                    let client = config.into_client(me, &audience)?;
+                    let client = config.into_client(me, cache.clone(), &audience)?;
                     inner.insert(audience, client);
                 }
                 Config::Http(config) => {
-                    let client = config.into_client(me, &audience)?;
+                    let client = config.into_client(me, cache.clone(), &audience)?;
                     inner.insert(audience, client);
                 }
             }
@@ -123,7 +129,12 @@ impl ClientMap {
 pub struct NoneConfig {}
 
 impl IntoClient for NoneConfig {
-    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, ConfigurationError>
+    fn into_client<A>(
+        self,
+        _me: &A,
+        _cache: Option<Cache>,
+        _audience: &str,
+    ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -158,7 +169,12 @@ pub struct LocalConfig {
 }
 
 impl IntoClient for LocalConfig {
-    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, ConfigurationError>
+    fn into_client<A>(
+        self,
+        _me: &A,
+        _cache: Option<Cache>,
+        _audience: &str,
+    ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -230,7 +246,12 @@ impl HttpConfig {
 }
 
 impl IntoClient for HttpConfig {
-    fn into_client<A>(self, me: &A, audience: &str) -> Result<Client, ConfigurationError>
+    fn into_client<A>(
+        self,
+        me: &A,
+        cache: Option<Cache>,
+        audience: &str,
+    ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
     {
@@ -268,6 +289,7 @@ impl IntoClient for HttpConfig {
             uri: self.uri,
             trusted: self.trusted,
             token,
+            cache,
         }))
     }
 }
@@ -279,6 +301,7 @@ struct HttpClient {
     uri: String,
     trusted: HashSet<AccountId>,
     token: String,
+    cache: Option<Cache>,
 }
 
 impl Authorize for HttpClient {
@@ -293,15 +316,30 @@ impl Authorize for HttpClient {
             return box_result(Ok(()));
         }
 
-        let payload = HttpRequest::new(
-            HttpRequestEntity::new(subject.audience(), vec!["accounts", subject.label()]),
-            HttpRequestEntity::new(&self.object_ns, object.clone()),
-            action,
-        );
-
         let intent = Intent::new(
             subject.clone(),
             object.iter().map(|&s| s.into()).collect(),
+            action,
+        );
+
+        // Return a result from the cache if available
+        let cache = self.cache.clone();
+        if let Some(ref cache) = cache {
+            if let CacheResponse::Hit(result) = cache.get(&intent.to_string()) {
+                return box_result(match result {
+                    true => Ok(()),
+                    false => Err(ErrorKind::Forbidden(IntentError::new(
+                        intent,
+                        "the action forbidden by tenant (cache hit)",
+                    ))
+                    .into()),
+                });
+            }
+        }
+
+        let payload = HttpRequest::new(
+            HttpRequestEntity::new(subject.audience(), vec!["accounts", subject.label()]),
+            HttpRequestEntity::new(&self.object_ns, object.clone()),
             action,
         );
 
@@ -316,12 +354,16 @@ impl Authorize for HttpClient {
                         match data {
                             Ok(data) => {
                                 if !data.contains(&intent.action().to_owned()) {
+                                    // Store the failure result into the cache
+                                    cache.map(|cache| cache.set(&intent.to_string(), false));
                                     future::ok(Err(ErrorKind::Forbidden(IntentError::new(
                                         intent,
                                         "the action forbidden by tenant",
                                     ))
                                     .into()))
                                 } else {
+                                    // Store the success result into the cache
+                                    cache.map(|cache| cache.set(&intent.to_string(), true));
                                     future::ok(Ok(()))
                                 }
                             }
@@ -392,3 +434,4 @@ pub use svc_authn::Authenticable;
 pub use self::error::{Error, Kind as ErrorKind};
 pub mod error;
 pub mod intent;
+pub mod cache;
