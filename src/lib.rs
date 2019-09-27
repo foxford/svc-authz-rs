@@ -1,8 +1,9 @@
-use jsonwebtoken::Algorithm;
-use serde_derive::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
+
+use jsonwebtoken::Algorithm;
+use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
 
 use crate::error::{ConfigurationError, IntentError};
@@ -19,6 +20,7 @@ pub enum Config {
     None(NoneConfig),
     Local(LocalConfig),
     Http(HttpConfig),
+    LocalWhitelist(LocalWhitelistConfig),
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -74,6 +76,10 @@ impl ClientMap {
                     inner.insert(audience, client);
                 }
                 Config::Http(config) => {
+                    let client = config.into_client(me, &audience)?;
+                    inner.insert(audience, client);
+                }
+                Config::LocalWhitelist(config) => {
                     let client = config.into_client(me, &audience)?;
                     inner.insert(audience, client);
                 }
@@ -364,6 +370,93 @@ struct HttpRequestEntity<'a> {
 impl<'a> HttpRequestEntity<'a> {
     fn new(namespace: &'a str, value: Vec<&'a str>) -> Self {
         Self { namespace, value }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LocalWhitelistRecord {
+    subject_account_id: AccountId,
+    object: Vec<String>,
+    action: String,
+}
+
+impl LocalWhitelistRecord {
+    pub fn new<A: Authenticable>(subject: &A, object: Vec<&str>, action: &str) -> Self {
+        Self {
+            subject_account_id: subject.as_account_id().to_owned(),
+            object: object.iter().map(|x| x.to_string()).collect(),
+            action: action.to_string(),
+        }
+    }
+
+    fn subject_account_id(&self) -> &AccountId {
+        &self.subject_account_id
+    }
+
+    fn object(&self) -> Vec<&str> {
+        self.object.iter().map(|x| &**x).collect()
+    }
+
+    fn action(&self) -> &str {
+        self.action.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalWhitelistConfig {
+    records: Vec<LocalWhitelistRecord>,
+}
+
+impl LocalWhitelistConfig {
+    pub fn new(records: Vec<LocalWhitelistRecord>) -> Self {
+        Self { records }
+    }
+}
+
+impl IntoClient for LocalWhitelistConfig {
+    fn into_client<A>(self, _me: &A, _audience: &str) -> Result<Client, ConfigurationError>
+    where
+        A: Authenticable,
+    {
+        Ok(Box::new(LocalWhitelistClient {
+            records: self.records,
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalWhitelistClient {
+    records: Vec<LocalWhitelistRecord>,
+}
+
+impl Authorize for LocalWhitelistClient {
+    fn authorize(
+        &self,
+        subject: &AccountId,
+        object: Vec<&str>,
+        action: &str,
+    ) -> Result<(), Error> {
+        let record = LocalWhitelistRecord::new(subject, object, action);
+
+        match self.records.iter().find(|&r| r == &record) {
+            Some(_) => Ok(()),
+            None => {
+                let intent = Intent::new(
+                    record.subject_account_id().clone(),
+                    record.object().iter().map(|&s| s.into()).collect(),
+                    record.action(),
+                );
+
+                let err = ErrorKind::Forbidden(IntentError::new(intent, "Not allowed"));
+                Err(err.into())
+            }
+        }
+    }
+
+    fn box_clone(&self) -> Box<dyn Authorize> {
+        Box::new(self.clone())
     }
 }
 
