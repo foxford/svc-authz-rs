@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
@@ -95,10 +95,12 @@ impl ClientMap {
         subject: &A,
         object: Vec<&str>,
         action: &str,
-    ) -> Result<(), Error>
+    ) -> Result<Duration, Error>
     where
         A: Authenticable,
     {
+        let start_time = Instant::now();
+
         let client = self.inner.get(audience).ok_or_else(|| {
             ErrorKind::Forbidden(IntentError::new(
                 Intent::new(
@@ -113,7 +115,9 @@ impl ClientMap {
             ))
         })?;
 
-        client.authorize(subject.as_account_id(), object, action)
+        client
+            .authorize(subject.as_account_id(), object, action)
+            .map(|()| Instant::now().duration_since(start_time))
     }
 }
 
@@ -432,12 +436,7 @@ pub struct LocalWhitelistClient {
 }
 
 impl Authorize for LocalWhitelistClient {
-    fn authorize(
-        &self,
-        subject: &AccountId,
-        object: Vec<&str>,
-        action: &str,
-    ) -> Result<(), Error> {
+    fn authorize(&self, subject: &AccountId, object: Vec<&str>, action: &str) -> Result<(), Error> {
         let record = LocalWhitelistRecord::new(subject, object, action);
 
         match self.records.iter().find(|&r| r == &record) {
