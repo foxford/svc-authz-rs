@@ -30,6 +30,7 @@ impl Display for Error {
         match &self.kind {
             Kind::Forbidden(inner) => fun("Forbidden", inner),
             Kind::Network(inner) => fun("Network", inner),
+            Kind::Internal(inner) => fun("Internal", inner),
         }
     }
 }
@@ -40,6 +41,7 @@ impl Display for Error {
 pub enum Kind {
     Forbidden(IntentError),
     Network(IntentError),
+    Internal(IntentError),
 }
 
 impl From<Kind> for Error {
