@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::future::{self, Either};
 use futures_timer::Delay;
+use chrono::{Duration, Utc};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
@@ -115,7 +115,7 @@ impl ClientMap {
     where
         A: Authenticable,
     {
-        let start_time = Instant::now();
+        let start_time = Utc::now();
 
         let client = self.inner.get(audience).ok_or_else(|| {
             ErrorKind::Forbidden(IntentError::new(
@@ -134,7 +134,7 @@ impl ClientMap {
         client
             .authorize(subject.as_account_id(), object, action)
             .await
-            .map(|()| Instant::now().duration_since(start_time))
+            .map(|()| Utc::now() - start_time)
     }
 }
 
@@ -294,10 +294,10 @@ impl IntoClient for HttpConfig {
         Ok(Box::new(HttpClient {
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
+            timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
             trusted: self.trusted,
             token,
             cache,
-            timeout: Duration::from_secs(self.timeout.unwrap_or(5)),
         }))
     }
 }
@@ -306,10 +306,10 @@ impl IntoClient for HttpConfig {
 struct HttpClient {
     object_ns: String,
     uri: String,
+    timeout: std::time::Duration,
     trusted: HashSet<AccountId>,
     token: String,
     cache: Option<Cache>,
-    timeout: Duration,
 }
 
 #[async_trait]
