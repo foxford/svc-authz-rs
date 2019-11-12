@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::time::Duration;
 
-use futures::{future, Future};
+use async_trait::async_trait;
+use futures::future::{self, Either};
+use futures_timer::Delay;
+use chrono::{Duration, Utc};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
@@ -27,13 +29,15 @@ pub enum Config {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+#[async_trait]
 trait Authorize: Sync + Send {
-    fn authorize(
+    async fn authorize(
         &self,
         subject: &AccountId,
         object: Vec<&str>,
         action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)>;
+    ) -> Result<(), Error>;
+
     fn box_clone(&self) -> Box<dyn Authorize>;
 }
 
@@ -101,19 +105,20 @@ impl ClientMap {
         Ok(Self { inner })
     }
 
-    pub fn authorize<A>(
+    pub async fn authorize<A>(
         &self,
         audience: &str,
         subject: &A,
         object: Vec<&str>,
         action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)>
+    ) -> Result<Duration, Error>
     where
         A: Authenticable,
     {
-        match self.inner.get(audience) {
-            Some(client) => client.authorize(subject.as_account_id(), object, action),
-            None => box_result(Err(ErrorKind::Forbidden(IntentError::new(
+        let start_time = Utc::now();
+
+        let client = self.inner.get(audience).ok_or_else(|| {
+            ErrorKind::Forbidden(IntentError::new(
                 Intent::new(
                     subject.as_account_id().clone(),
                     object.iter().map(|&s| s.into()).collect(),
@@ -124,8 +129,12 @@ impl ClientMap {
                     audience
                 ),
             ))
-            .into())),
-        }
+        })?;
+
+        client
+            .authorize(subject.as_account_id(), object, action)
+            .await
+            .map(|()| Utc::now() - start_time)
     }
 }
 
@@ -151,14 +160,15 @@ impl IntoClient for NoneConfig {
 #[derive(Debug, Clone)]
 struct NoneClient {}
 
+#[async_trait]
 impl Authorize for NoneClient {
-    fn authorize(
+    async fn authorize(
         &self,
         _subject: &AccountId,
         _object: Vec<&str>,
         _action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)> {
-        box_result(Ok(()))
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
@@ -195,27 +205,29 @@ struct LocalClient {
     trusted: HashSet<AccountId>,
 }
 
+#[async_trait]
 impl Authorize for LocalClient {
-    fn authorize(
+    async fn authorize(
         &self,
         subject: &AccountId,
         object: Vec<&str>,
         action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)> {
+    ) -> Result<(), Error> {
         // Allow access if the subject in the trusted list
-        if let true = self.trusted.contains(subject) {
-            return box_result(Ok(()));
-        }
+        if self.trusted.contains(subject) {
+            Ok(())
+        } else {
+            let intent_err = IntentError::new(
+                Intent::new(
+                    subject.clone(),
+                    object.iter().map(|&s| s.into()).collect(),
+                    action,
+                ),
+                "the subject isn't in a trusted list",
+            );
 
-        box_result(Err(ErrorKind::Forbidden(IntentError::new(
-            Intent::new(
-                subject.clone(),
-                object.iter().map(|&s| s.into()).collect(),
-                action,
-            ),
-            "the subject isn't in a trusted list",
-        ))
-        .into()))
+            Err(ErrorKind::Forbidden(intent_err).into())
+        }
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
@@ -279,20 +291,10 @@ impl IntoClient for HttpConfig {
                 ))
             })?;
 
-        let inner = reqwest::r#async::Client::builder()
-            .timeout(Duration::from_secs(self.timeout.unwrap_or(5)))
-            .build()
-            .map_err(|err| {
-                ConfigurationError::new(&format!(
-                    "error creating an HTTP client for audience = '{}', {}",
-                    audience, &err,
-                ))
-            })?;
-
         Ok(Box::new(HttpClient {
-            inner,
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
+            timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
             trusted: self.trusted,
             token,
             cache,
@@ -302,24 +304,25 @@ impl IntoClient for HttpConfig {
 
 #[derive(Debug, Clone)]
 struct HttpClient {
-    inner: reqwest::r#async::Client,
     object_ns: String,
     uri: String,
+    timeout: std::time::Duration,
     trusted: HashSet<AccountId>,
     token: String,
     cache: Option<Cache>,
 }
 
+#[async_trait]
 impl Authorize for HttpClient {
-    fn authorize(
+    async fn authorize(
         &self,
         subject: &AccountId,
         object: Vec<&str>,
         action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)> {
+    ) -> Result<(), Error> {
         // Allow access if the subject in the trusted list
         if let true = self.trusted.contains(subject) {
-            return box_result(Ok(()));
+            return Ok(());
         }
 
         let intent = Intent::new(
@@ -332,14 +335,14 @@ impl Authorize for HttpClient {
         let cache = self.cache.clone();
         if let Some(ref cache) = cache {
             if let CacheResponse::Hit(result) = cache.get(&intent.to_string()) {
-                return box_result(match result {
+                return match result {
                     true => Ok(()),
                     false => Err(ErrorKind::Forbidden(IntentError::new(
                         intent,
                         "the action forbidden by tenant (cache hit)",
                     ))
                     .into()),
-                });
+                };
             }
         }
 
@@ -349,46 +352,67 @@ impl Authorize for HttpClient {
             action,
         );
 
-        Box::new(
-            self.inner
-                .post(&self.uri)
-                .bearer_auth(&self.token)
-                .json(&payload)
-                .send()
-                .then(|resp| match resp {
-                    Ok(mut resp) => future::Either::A(resp.json::<Vec<String>>().then(|data| {
-                        match data {
+        let request = surf::post(&self.uri)
+            .set_header("Authorization", format!("Bearer {}", self.token))
+            .body_json(&payload);
+
+        match request {
+            Ok(req) => {
+                match future::select(req, Delay::new(self.timeout)).await {
+                    Either::Left((Ok(mut resp), _)) => {
+                        match resp.body_json::<Vec<String>>().await {
                             Ok(data) => {
                                 if !data.contains(&intent.action().to_owned()) {
                                     // Store the failure result into the cache
                                     cache.map(|cache| cache.set(&intent.to_string(), false));
-                                    future::ok(Err(ErrorKind::Forbidden(IntentError::new(
-                                        intent,
-                                        "the action forbidden by tenant",
-                                    ))
-                                    .into()))
+
+                                    let intent_err =
+                                        IntentError::new(intent, "the action forbidden by tenant");
+
+                                    Err(ErrorKind::Forbidden(intent_err).into())
                                 } else {
                                     // Store the success result into the cache
                                     cache.map(|cache| cache.set(&intent.to_string(), true));
-                                    future::ok(Ok(()))
+                                    Ok(())
                                 }
                             }
-                            Err(_) => future::ok(Err(ErrorKind::Network(IntentError::new(
-                                intent,
-                                "invalid format of the authorization response",
-                            ))
-                            .into())),
+                            Err(_) => {
+                                let intent_err = IntentError::new(
+                                    intent,
+                                    "invalid format of the authorization response",
+                                );
+
+                                Err(ErrorKind::Network(intent_err).into())
+                            }
                         }
-                    })),
-                    Err(err) => {
-                        future::Either::B(future::ok(Err(ErrorKind::Network(IntentError::new(
+                    }
+                    Either::Left((Err(err), _)) => {
+                        let intent_err = IntentError::new(
                             intent,
                             &format!("error sending the authorization request, {}", &err),
-                        ))
-                        .into())))
+                        );
+
+                        Err(ErrorKind::Network(intent_err).into())
                     }
-                }),
-        )
+                    Either::Right((_, _)) => {
+                        let intent_err = IntentError::new(
+                            intent,
+                            &format!("timed out sending the authorization request"),
+                        );
+
+                        Err(ErrorKind::Network(intent_err).into())
+                    }
+                }
+            }
+            Err(err) => {
+                let intent_err = IntentError::new(
+                    intent,
+                    &format!("failed to build authorization request, {}", &err),
+                );
+
+                Err(ErrorKind::Internal(intent_err).into())
+            }
+        }
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
@@ -488,16 +512,17 @@ pub struct LocalWhitelistClient {
     records: Vec<LocalWhitelistRecord>,
 }
 
+#[async_trait]
 impl Authorize for LocalWhitelistClient {
-    fn authorize(
+    async fn authorize(
         &self,
         subject: &AccountId,
         object: Vec<&str>,
         action: &str,
-    ) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)> {
+    ) -> Result<(), Error> {
         let record = LocalWhitelistRecord::new(subject, object, action);
 
-        let result = match self.records.iter().find(|&r| r == &record) {
+        match self.records.iter().find(|&r| r == &record) {
             Some(_) => Ok(()),
             None => {
                 let intent = Intent::new(
@@ -509,22 +534,12 @@ impl Authorize for LocalWhitelistClient {
                 let err = ErrorKind::Forbidden(IntentError::new(intent, "Not allowed"));
                 Err(err.into())
             }
-        };
-
-        box_result(result)
+        }
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
         Box::new(self.clone())
     }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-fn box_result(
-    result: Result<(), Error>,
-) -> Box<(dyn Future<Item = Result<(), Error>, Error = ()> + Send)> {
-    Box::new(future::ok(result))
 }
 
 ////////////////////////////////////////////////////////////////////////////////
