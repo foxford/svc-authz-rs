@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use async_trait::async_trait;
-use futures::future::{self, Either};
-use futures_timer::Delay;
 use chrono::{Duration, Utc};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
@@ -292,6 +290,7 @@ impl IntoClient for HttpConfig {
             })?;
 
         Ok(Box::new(HttpClient {
+            client: reqwest::Client::new(),
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
             timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
@@ -304,6 +303,7 @@ impl IntoClient for HttpConfig {
 
 #[derive(Debug, Clone)]
 struct HttpClient {
+    client: reqwest::Client,
     object_ns: String,
     uri: String,
     timeout: std::time::Duration,
@@ -335,13 +335,14 @@ impl Authorize for HttpClient {
         let cache = self.cache.clone();
         if let Some(ref cache) = cache {
             if let CacheResponse::Hit(result) = cache.get(&intent.to_string()) {
-                return match result {
-                    true => Ok(()),
-                    false => Err(ErrorKind::Forbidden(IntentError::new(
+                return if result {
+                    Ok(())
+                } else {
+                    Err(ErrorKind::Forbidden(IntentError::new(
                         intent,
                         "the action forbidden by tenant (cache hit)",
                     ))
-                    .into()),
+                    .into())
                 };
             }
         }
@@ -352,65 +353,60 @@ impl Authorize for HttpClient {
             action,
         );
 
-        let request = surf::post(&self.uri)
-            .set_header("Authorization", format!("Bearer {}", self.token))
-            .body_json(&payload);
+        let req = self
+            .client
+            .post(&self.uri)
+            .header("Authorization", format!("Bearer {}", self.token))
+            .json(&payload)
+            .send();
 
-        match request {
-            Ok(req) => {
-                match future::select(req, Delay::new(self.timeout)).await {
-                    Either::Left((Ok(mut resp), _)) => {
-                        match resp.body_json::<Vec<String>>().await {
-                            Ok(data) => {
-                                if !data.contains(&intent.action().to_owned()) {
-                                    // Store the failure result into the cache
-                                    cache.map(|cache| cache.set(&intent.to_string(), false));
-
-                                    let intent_err =
-                                        IntentError::new(intent, "the action forbidden by tenant");
-
-                                    Err(ErrorKind::Forbidden(intent_err).into())
-                                } else {
-                                    // Store the success result into the cache
-                                    cache.map(|cache| cache.set(&intent.to_string(), true));
-                                    Ok(())
-                                }
+        match tokio::time::timeout(self.timeout, req).await {
+            Ok(Ok(resp)) => {
+                match resp.json::<Vec<String>>().await {
+                    Ok(data) => {
+                        if !data.contains(&intent.action().to_owned()) {
+                            // Store the failure result into the cache
+                            if let Some(cache) = cache {
+                                cache.set(&intent.to_string(), false)
                             }
-                            Err(_) => {
-                                let intent_err = IntentError::new(
-                                    intent,
-                                    "invalid format of the authorization response",
-                                );
 
-                                Err(ErrorKind::Network(intent_err).into())
+                            let intent_err =
+                                IntentError::new(intent, "the action forbidden by tenant");
+
+                            Err(ErrorKind::Forbidden(intent_err).into())
+                        } else {
+                            // Store the success result into the cache
+                            if let Some(cache) = cache {
+                                cache.set(&intent.to_string(), true)
                             }
+                            Ok(())
                         }
                     }
-                    Either::Left((Err(err), _)) => {
+                    Err(_) => {
                         let intent_err = IntentError::new(
                             intent,
-                            &format!("error sending the authorization request, {}", &err),
-                        );
-
-                        Err(ErrorKind::Network(intent_err).into())
-                    }
-                    Either::Right((_, _)) => {
-                        let intent_err = IntentError::new(
-                            intent,
-                            &format!("timed out sending the authorization request"),
+                            "invalid format of the authorization response",
                         );
 
                         Err(ErrorKind::Network(intent_err).into())
                     }
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let intent_err = IntentError::new(
                     intent,
-                    &format!("failed to build authorization request, {}", &err),
+                    &format!("error sending the authorization request, {}", &err),
                 );
 
-                Err(ErrorKind::Internal(intent_err).into())
+                Err(ErrorKind::Network(intent_err).into())
+            }
+            Err(_) => {
+                let intent_err = IntentError::new(
+                    intent,
+                    &"timed out sending the authorization request".to_string(),
+                );
+
+                Err(ErrorKind::Network(intent_err).into())
             }
         }
     }
@@ -462,7 +458,7 @@ impl LocalWhitelistRecord {
     pub fn new<A: Authenticable>(subject: &A, object: Vec<&str>, action: &str) -> Self {
         Self {
             subject_account_id: subject.as_account_id().to_owned(),
-            object: object.iter().map(|x| x.to_string()).collect(),
+            object: object.iter().map(|x| (*x).to_string()).collect(),
             action: action.to_string(),
         }
     }
