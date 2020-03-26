@@ -3,7 +3,7 @@ use svc_authn::AccountId;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Intent {
     subject: AccountId,
     object: Vec<String>,

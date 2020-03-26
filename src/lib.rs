@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 use futures::future::{self, Either};
 use futures_timer::Delay;
-use chrono::{Duration, Utc};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
@@ -247,9 +248,16 @@ pub struct HttpConfig {
     #[serde(deserialize_with = "svc_authn::serde::file")]
     key: Vec<u8>,
     timeout: Option<u64>,
+    user_agent: Option<String>,
+    #[serde(default = "HttpConfig::default_max_retries")]
+    max_retries: usize,
 }
 
 impl HttpConfig {
+    fn default_max_retries() -> usize {
+        1
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -292,24 +300,30 @@ impl IntoClient for HttpConfig {
             })?;
 
         Ok(Box::new(HttpClient {
+            client: Arc::new(surf::Client::new()),
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
             timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
             trusted: self.trusted,
             token,
             cache,
+            user_agent: self.user_agent,
+            max_retries: self.max_retries,
         }))
     }
 }
 
 #[derive(Debug, Clone)]
 struct HttpClient {
+    client: Arc<surf::Client<http_client::native::NativeClient>>,
     object_ns: String,
     uri: String,
     timeout: std::time::Duration,
     trusted: HashSet<AccountId>,
     token: String,
     cache: Option<Cache>,
+    user_agent: Option<String>,
+    max_retries: usize,
 }
 
 #[async_trait]
@@ -352,67 +366,89 @@ impl Authorize for HttpClient {
             action,
         );
 
-        let request = surf::post(&self.uri)
-            .set_header("Authorization", format!("Bearer {}", self.token))
-            .body_json(&payload);
+        let intent_err = IntentError::new(
+            intent.clone(),
+            "Not attempted to send the authorization request. Check out that max_retries > 0",
+        );
 
-        match request {
-            Ok(req) => {
-                match future::select(req, Delay::new(self.timeout)).await {
-                    Either::Left((Ok(mut resp), _)) => {
-                        match resp.body_json::<Vec<String>>().await {
-                            Ok(data) => {
-                                if !data.contains(&intent.action().to_owned()) {
-                                    // Store the failure result into the cache
-                                    cache.map(|cache| cache.set(&intent.to_string(), false));
+        let mut result = Err(ErrorKind::Internal(intent_err).into());
 
-                                    let intent_err =
-                                        IntentError::new(intent, "the action forbidden by tenant");
+        for _ in 0..self.max_retries {
+            let intent_clone = intent.clone();
 
-                                    Err(ErrorKind::Forbidden(intent_err).into())
-                                } else {
-                                    // Store the success result into the cache
-                                    cache.map(|cache| cache.set(&intent.to_string(), true));
-                                    Ok(())
+            let mut request_builder = self
+                .client
+                .post(&self.uri)
+                .set_header("Authorization", format!("Bearer {}", self.token));
+
+            if let Some(ref user_agent) = self.user_agent {
+                request_builder = request_builder.set_header("User-Agent", user_agent);
+            }
+
+            let request = request_builder.body_json(&payload);
+
+            result = match request {
+                Ok(req) => {
+                    match future::select(req, Delay::new(self.timeout)).await {
+                        Either::Left((Ok(mut resp), _)) => {
+                            match resp.body_json::<Vec<String>>().await {
+                                Ok(data) => {
+                                    if !data.contains(&intent.action().to_owned()) {
+                                        // Store the failure result into the cache
+                                        cache.map(|cache| cache.set(&intent.to_string(), false));
+
+                                        let intent_err = IntentError::new(
+                                            intent,
+                                            "the action forbidden by tenant",
+                                        );
+
+                                        return Err(ErrorKind::Forbidden(intent_err).into());
+                                    } else {
+                                        // Store the success result into the cache
+                                        cache.map(|cache| cache.set(&intent.to_string(), true));
+                                        return Ok(());
+                                    }
+                                }
+                                Err(_) => {
+                                    let intent_err = IntentError::new(
+                                        intent_clone,
+                                        "invalid format of the authorization response",
+                                    );
+
+                                    Err(ErrorKind::Network(intent_err).into())
                                 }
                             }
-                            Err(_) => {
-                                let intent_err = IntentError::new(
-                                    intent,
-                                    "invalid format of the authorization response",
-                                );
+                        }
+                        Either::Left((Err(err), _)) => {
+                            let intent_err = IntentError::new(
+                                intent_clone,
+                                &format!("error sending the authorization request, {}", &err),
+                            );
 
-                                Err(ErrorKind::Network(intent_err).into())
-                            }
+                            Err(ErrorKind::Network(intent_err).into())
+                        }
+                        Either::Right((_, _)) => {
+                            let intent_err = IntentError::new(
+                                intent_clone,
+                                &format!("timed out sending the authorization request"),
+                            );
+
+                            Err(ErrorKind::Network(intent_err).into())
                         }
                     }
-                    Either::Left((Err(err), _)) => {
-                        let intent_err = IntentError::new(
-                            intent,
-                            &format!("error sending the authorization request, {}", &err),
-                        );
+                }
+                Err(err) => {
+                    let intent_err = IntentError::new(
+                        intent_clone,
+                        &format!("failed to build authorization request, {}", &err),
+                    );
 
-                        Err(ErrorKind::Network(intent_err).into())
-                    }
-                    Either::Right((_, _)) => {
-                        let intent_err = IntentError::new(
-                            intent,
-                            &format!("timed out sending the authorization request"),
-                        );
-
-                        Err(ErrorKind::Network(intent_err).into())
-                    }
+                    return Err(ErrorKind::Internal(intent_err).into());
                 }
             }
-            Err(err) => {
-                let intent_err = IntentError::new(
-                    intent,
-                    &format!("failed to build authorization request, {}", &err),
-                );
-
-                Err(ErrorKind::Internal(intent_err).into())
-            }
         }
+
+        result
     }
 
     fn box_clone(&self) -> Box<dyn Authorize> {
