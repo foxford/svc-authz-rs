@@ -361,8 +361,8 @@ impl Authorize for HttpClient {
         }
 
         let payload = HttpRequest::new(
-            HttpRequestEntity::new(subject.audience(), vec!["accounts", subject.label()]),
-            HttpRequestEntity::new(&self.object_ns, object.clone()),
+            HttpSubject::new(subject.audience(), subject.label()),
+            HttpObject::new(&self.object_ns, object.clone()),
             action,
         );
 
@@ -458,13 +458,13 @@ impl Authorize for HttpClient {
 
 #[derive(Debug, Serialize)]
 struct HttpRequest<'a> {
-    subject: HttpRequestEntity<'a>,
-    object: HttpRequestEntity<'a>,
+    subject: HttpSubject<'a>,
+    object: HttpObject<'a>,
     action: &'a str,
 }
 
 impl<'a> HttpRequest<'a> {
-    fn new(subject: HttpRequestEntity<'a>, object: HttpRequestEntity<'a>, action: &'a str) -> Self {
+    fn new(subject: HttpSubject<'a>, object: HttpObject<'a>, action: &'a str) -> Self {
         Self {
             subject,
             object,
@@ -474,12 +474,24 @@ impl<'a> HttpRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct HttpRequestEntity<'a> {
+struct HttpSubject<'a> {
+    namespace: &'a str,
+    value: &'a str,
+}
+
+impl<'a> HttpSubject<'a> {
+    fn new(namespace: &'a str, value: &'a str) -> Self {
+        Self { namespace, value }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HttpObject<'a> {
     namespace: &'a str,
     value: Vec<&'a str>,
 }
 
-impl<'a> HttpRequestEntity<'a> {
+impl<'a> HttpObject<'a> {
     fn new(namespace: &'a str, value: Vec<&'a str>) -> Self {
         Self { namespace, value }
     }
