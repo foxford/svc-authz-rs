@@ -349,13 +349,14 @@ impl Authorize for HttpClient {
         let cache = self.cache.clone();
         if let Some(ref cache) = cache {
             if let CacheResponse::Hit(result) = cache.get(&intent.to_string()) {
-                return match result {
-                    true => Ok(()),
-                    false => Err(ErrorKind::Forbidden(IntentError::new(
+                return if result {
+                    Ok(())
+                } else {
+                    Err(ErrorKind::Forbidden(IntentError::new(
                         intent,
                         "the action forbidden by tenant (cache hit)",
                     ))
-                    .into()),
+                    .into())
                 };
             }
         }
@@ -395,7 +396,9 @@ impl Authorize for HttpClient {
                                 Ok(data) => {
                                     if !data.contains(&intent.action().to_owned()) {
                                         // Store the failure result into the cache
-                                        cache.map(|cache| cache.set(&intent.to_string(), false));
+                                        if let Some(cache) = cache {
+                                            cache.set(&intent.to_string(), false)
+                                        }
 
                                         let intent_err = IntentError::new(
                                             intent,
@@ -405,7 +408,9 @@ impl Authorize for HttpClient {
                                         return Err(ErrorKind::Forbidden(intent_err).into());
                                     } else {
                                         // Store the success result into the cache
-                                        cache.map(|cache| cache.set(&intent.to_string(), true));
+                                        if let Some(cache) = cache {
+                                            cache.set(&intent.to_string(), true)
+                                        }
                                         return Ok(());
                                     }
                                 }
@@ -430,7 +435,7 @@ impl Authorize for HttpClient {
                         Either::Right((_, _)) => {
                             let intent_err = IntentError::new(
                                 intent_clone,
-                                &format!("timed out sending the authorization request"),
+                                "timed out sending the authorization request",
                             );
 
                             Err(ErrorKind::Network(intent_err).into())
@@ -510,7 +515,7 @@ impl LocalWhitelistRecord {
     pub fn new<A: Authenticable>(subject: &A, object: Vec<&str>, action: &str) -> Self {
         Self {
             subject_account_id: subject.as_account_id().to_owned(),
-            object: object.iter().map(|x| x.to_string()).collect(),
+            object: object.iter().map(|x| (*x).to_string()).collect(),
             action: action.to_string(),
         }
     }
