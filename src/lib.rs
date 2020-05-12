@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use futures::future::{self, Either};
 use futures_timer::Delay;
+use http_types::headers::HeaderName;
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
@@ -377,13 +379,18 @@ impl Authorize for HttpClient {
         for _ in 0..self.max_retries {
             let intent_clone = intent.clone();
 
-            let mut request_builder = self
-                .client
-                .post(&self.uri)
-                .set_header("Authorization", format!("Bearer {}", self.token));
+            // TODO: replace HeaderName::from_str with constant
+            let mut request_builder = self.client.post(&self.uri).set_header(
+                HeaderName::from_str("Authorization").expect("constant"),
+                format!("Bearer {}", self.token),
+            );
 
             if let Some(ref user_agent) = self.user_agent {
-                request_builder = request_builder.set_header("User-Agent", user_agent);
+                // TODO: replace HeaderName::from_str with constant
+                request_builder = request_builder.set_header(
+                    HeaderName::from_str("User-Agent").expect("constant"),
+                    user_agent,
+                );
             }
 
             let request = request_builder.body_json(&payload);
