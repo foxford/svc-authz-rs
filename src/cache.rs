@@ -19,6 +19,19 @@ pub fn create_pool(url: &str, size: u32, timeout: u64) -> ConnectionPool {
     Arc::new(pool)
 }
 
+pub fn create_pool2(url: &str, size: u32, idle_size: Option<u32>, timeout: u64) -> ConnectionPool {
+    let manager =
+        RedisConnectionManager::new(url).expect("Error creating cache connection manager");
+    let pool = Pool::builder()
+        .max_size(size)
+        .min_idle(idle_size)
+        .connection_timeout(Duration::from_secs(timeout))
+        .build(manager)
+        .expect("Error creating a cache pool");
+
+    Arc::new(pool)
+}
+
 #[derive(Debug, Clone)]
 pub struct Cache {
     pool: ConnectionPool,
