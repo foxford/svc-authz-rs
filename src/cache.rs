@@ -1,10 +1,11 @@
 use log::error;
-use r2d2_redis::{r2d2::Pool, RedisConnectionManager};
+use r2d2_redis::RedisConnectionManager;
 use std::sync::Arc;
 use std::time::Duration;
 
-type ConnectionPool = Arc<Pool<RedisConnectionManager>>;
+pub type ConnectionPool = Arc<Pool<RedisConnectionManager>>;
 
+pub use r2d2_redis::r2d2::Pool;
 pub use r2d2_redis::redis::Commands;
 
 pub fn create_pool(url: &str, size: u32, timeout: u64) -> ConnectionPool {
