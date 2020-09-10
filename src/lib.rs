@@ -348,7 +348,11 @@ impl Authorize for HttpClient {
         // Return a result from the cache if available
         let cache = self.cache.clone();
         if let Some(ref cache) = cache {
-            if let CacheResponse::Hit(result) = cache.get(&intent.to_string()) {
+            let cache = cache.clone();
+            let intent_ = intent.to_string();
+            let cache_response = async_std::task::spawn_blocking(move || cache.get(&intent_)).await;
+
+            if let CacheResponse::Hit(result) = cache_response {
                 return if result {
                     Ok(())
                 } else {
@@ -400,7 +404,11 @@ impl Authorize for HttpClient {
                                     if !data.contains(&intent.action().to_owned()) {
                                         // Store the failure result into the cache
                                         if let Some(cache) = cache {
-                                            cache.set(&intent.to_string(), false)
+                                            let intent_ = intent.to_string();
+                                            async_std::task::spawn_blocking(move || {
+                                                cache.set(&intent_, false)
+                                            })
+                                            .await
                                         }
 
                                         let intent_err = IntentError::new(
@@ -412,7 +420,11 @@ impl Authorize for HttpClient {
                                     } else {
                                         // Store the success result into the cache
                                         if let Some(cache) = cache {
-                                            cache.set(&intent.to_string(), true)
+                                            let intent_ = intent.to_string();
+                                            async_std::task::spawn_blocking(move || {
+                                                cache.set(&intent_, true)
+                                            })
+                                            .await
                                         }
                                         return Ok(());
                                     }
