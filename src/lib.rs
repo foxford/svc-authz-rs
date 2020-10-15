@@ -7,6 +7,7 @@ use chrono::{Duration, Utc};
 use futures::future::{self, Either};
 use futures_timer::Delay;
 use jsonwebtoken::Algorithm;
+use log::debug;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
 
@@ -345,6 +346,8 @@ impl Authorize for HttpClient {
             action,
         );
 
+        eprintln!("Authz checking intent = {}", intent);
+
         // Return a result from the cache if available
         let cache = self.cache.clone();
         if let Some(ref cache) = cache {
@@ -354,8 +357,11 @@ impl Authorize for HttpClient {
 
             if let CacheResponse::Hit(result) = cache_response {
                 return if result {
+                    eprintln!("Authz cache hit, access granted, intent = {}", intent);
                     Ok(())
                 } else {
+                    eprintln!("Authz cache hit, access denied, intent = {}", intent);
+
                     Err(ErrorKind::Forbidden(IntentError::new(
                         intent,
                         "the action forbidden by tenant (cache hit)",
@@ -411,6 +417,8 @@ impl Authorize for HttpClient {
                                             .await
                                         }
 
+                                        eprintln!("Authz no cache hit, access denied, intent = {}", intent);
+
                                         let intent_err = IntentError::new(
                                             intent,
                                             "the action forbidden by tenant",
@@ -419,6 +427,8 @@ impl Authorize for HttpClient {
                                         return Err(ErrorKind::Forbidden(intent_err).into());
                                     } else {
                                         // Store the success result into the cache
+                                        eprintln!("Authz no cache hit, access granted, intent = {}", intent);
+
                                         if let Some(cache) = cache {
                                             let intent_ = intent.to_string();
                                             async_std::task::spawn_blocking(move || {
@@ -426,6 +436,7 @@ impl Authorize for HttpClient {
                                             })
                                             .await
                                         }
+
                                         return Ok(());
                                     }
                                 }
