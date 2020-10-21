@@ -21,26 +21,72 @@ pub fn create_pool(url: &str, size: u32, idle_size: Option<u32>, timeout: u64) -
     Arc::new(pool)
 }
 
-#[derive(Debug, Clone)]
-pub struct Cache {
-    pool: ConnectionPool,
-    expiration_time: u64,
+pub trait AuthzCache: Send + Sync + std::fmt::Debug {
+    fn get(&self, key: &str) -> Response;
+    fn mget(&self, keys: &[&str]) -> Vec<Response>;
+
+    fn set(&self, key: &str, value: bool);
+    fn set_ex(&self, key: &str, value: bool, expiration_seconds: usize);
+    fn box_clone(&self) -> Box<dyn AuthzCache>;
 }
 
-pub(crate) enum Response {
+impl Clone for Box<dyn AuthzCache> {
+    fn clone(&self) -> Self {
+        self.box_clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RedisCache {
+    pool: ConnectionPool,
+    expiration_time: usize,
+}
+
+#[derive(Debug)]
+pub enum Response {
     Hit(bool),
     Miss,
 }
 
-impl Cache {
-    pub fn new(pool: ConnectionPool, expiration_time: u64) -> Self {
+impl RedisCache {
+    pub fn new(pool: ConnectionPool, expiration_time: usize) -> Self {
         Self {
             pool,
             expiration_time,
         }
     }
 
-    pub(crate) fn get(&self, key: &str) -> Response {
+    fn set(&self, key: &str, value: bool, expiration_seconds: usize) {
+        if let Ok(mut conn) = self.pool.get() {
+            let result: Result<bool, _> = conn.set_ex(key, value as u8, expiration_seconds);
+            if Ok(true) == result {
+                return;
+            }
+        }
+
+        error!("Cache is unavailable");
+    }
+
+    fn mget(&self, keys: &[&str]) -> Vec<Response> {
+        if let Ok(mut conn) = self.pool.get() {
+            if let Ok(values) = conn.get::<_, Vec<Option<u32>>>(keys) {
+                return values
+                    .into_iter()
+                    .map(|v| match v {
+                        Some(1) => Response::Hit(true),
+                        Some(_) => Response::Hit(false),
+                        None => Response::Miss,
+                    })
+                    .collect::<Vec<_>>();
+            }
+        }
+
+        error!("Cache is unavailable");
+        let v: Vec<Response> = vec![];
+        v
+    }
+
+    fn get(&self, key: &str) -> Response {
         if let Ok(mut conn) = self.pool.get() {
             if let Ok(resp) = conn.get(key) {
                 return match resp {
@@ -54,16 +100,26 @@ impl Cache {
         error!("Cache is unavailable");
         Response::Miss
     }
+}
 
-    pub(crate) fn set(&self, key: &str, value: bool) {
-        if let Ok(mut conn) = self.pool.get() {
-            let result: Result<bool, _> =
-                conn.set_ex(key, value as u8, self.expiration_time as usize);
-            if Ok(true) == result {
-                return;
-            }
-        }
+impl AuthzCache for RedisCache {
+    fn get(&self, intent: &str) -> Response {
+        self.get(intent)
+    }
 
-        error!("Cache is unavailable");
+    fn mget(&self, keys: &[&str]) -> Vec<Response> {
+        self.mget(keys)
+    }
+
+    fn set(&self, key: &str, value: bool) {
+        self.set(key, value, self.expiration_time);
+    }
+
+    fn set_ex(&self, key: &str, value: bool, expiration_seconds: usize) {
+        self.set(key, value, expiration_seconds);
+    }
+
+    fn box_clone(&self) -> Box<dyn AuthzCache> {
+        Box::new(self.clone())
     }
 }
