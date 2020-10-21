@@ -369,7 +369,7 @@ impl Authorize for HttpClient {
                             }
                             Err(_) => future::ok(Err(ErrorKind::Network(IntentError::new(
                                 intent,
-                                "invalid format of the authorization response",
+                                &format!("invalid format of the authorization response, body = {:?}", resp.text()),
                             ))
                             .into())),
                         }
