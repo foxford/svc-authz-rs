@@ -481,6 +481,7 @@ struct HttpRequest<'a> {
     subject: HttpSubject<'a>,
     object: HttpObject<'a>,
     action: &'a str,
+    x_action: &'a str,
 }
 
 impl<'a> HttpRequest<'a> {
@@ -489,6 +490,7 @@ impl<'a> HttpRequest<'a> {
             subject,
             object,
             action,
+            x_action: action
         }
     }
 }
