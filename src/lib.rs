@@ -426,16 +426,16 @@ impl Authorize for HttpClient {
                 })
                 .await;
 
-                match cache_response[0..2] {
-                    [_, CacheResponse::Hit(true)] => {
+                match cache_response.get(0..2) {
+                    Some([_, CacheResponse::Hit(true)]) => {
                         return Err(ErrorKind::Forbidden(IntentError::new(
                             intent,
                             "banned (cache hit)",
                         ))
                         .into());
                     }
-                    [CacheResponse::Hit(result), CacheResponse::Hit(false)] => {
-                        return if result {
+                    Some([CacheResponse::Hit(result), CacheResponse::Hit(false)]) => {
+                        return if *result {
                             Ok(())
                         } else {
                             Err(ErrorKind::Forbidden(IntentError::new(
@@ -445,7 +445,7 @@ impl Authorize for HttpClient {
                             .into())
                         };
                     }
-                    [_, _] => {}
+                    Some([_, _]) => {}
                     _ => {
                         log::warn!("Cache ban request returned improper number of responses, expected 2, got = {:?}", cache_response);
                     }
