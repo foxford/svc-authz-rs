@@ -3,10 +3,10 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use async_std::prelude::*;
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use futures::future::{self, Either};
-use futures_timer::Delay;
+use isahc::{error::ErrorKind as HttpErrorKind, prelude::*, Request};
 use jsonwebtoken::Algorithm;
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
@@ -142,7 +142,7 @@ impl ClientMap {
         let client = self.inner.get(&audience).ok_or_else(|| {
             ErrorKind::Forbidden(IntentError::new(
                 Intent::new(subject.as_account_id().clone(), object.clone(), &action),
-                &format!(
+                format!(
                     "no authorization configuration for the audience = {}",
                     audience
                 ),
@@ -355,8 +355,33 @@ impl IntoClient for HttpConfig {
                 ))
             })?;
 
+        let timeout = std::time::Duration::from_secs(self.timeout.unwrap_or(5));
+
+        let builder = isahc::HttpClient::builder()
+            .timeout(timeout)
+            .default_header(
+                http_types::headers::AUTHORIZATION.as_str(),
+                format!("Bearer {}", token),
+            )
+            .default_header(
+                http_types::headers::CONTENT_TYPE.as_str(),
+                "application/json",
+            );
+        let builder = if let Some(ref user_agent) = self.user_agent {
+            builder.default_header(http_types::headers::USER_AGENT.as_str(), user_agent)
+        } else {
+            builder
+        };
+
+        let client = builder.build().map_err(|err| {
+            ConfigurationError::new(&format!(
+                "error converting an authorization config for audience = '{}' into client, {}",
+                audience, &err,
+            ))
+        })?;
+
         Ok(Box::new(HttpClient {
-            client: Arc::new(surf::Client::new()),
+            client: Arc::new(client),
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
             timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
@@ -372,7 +397,7 @@ impl IntoClient for HttpConfig {
 
 #[derive(Clone)]
 struct HttpClient {
-    client: Arc<surf::Client<http_client::native::NativeClient>>,
+    client: Arc<isahc::HttpClient>,
     object_ns: String,
     uri: String,
     timeout: std::time::Duration,
@@ -507,73 +532,72 @@ impl Authorize for HttpClient {
         for _ in 0..self.max_retries {
             let intent_clone = intent.clone();
 
-            let mut request_builder = self.client.post(&self.uri).set_header(
-                http_types::headers::AUTHORIZATION,
-                format!("Bearer {}", self.token),
-            );
+            let payload = serde_json::to_string(&payload).map_err(|err| {
+                let intent_err = IntentError::new(
+                    intent_clone.clone(),
+                    format!("Failed to serialize authorization request body, {}", &err),
+                );
 
-            if let Some(ref user_agent) = self.user_agent {
-                request_builder = request_builder
-                    .set_header(http_types::headers::USER_AGENT, user_agent.to_owned());
-            }
+                let e: Error = ErrorKind::Internal(intent_err).into();
+                e
+            })?;
 
-            let request = request_builder.body_json(&payload);
+            let request = Request::post(&self.uri).body(payload).map_err(|err| {
+                let intent_err = IntentError::new(
+                    intent_clone.clone(),
+                    format!("Failed to build authorization request, {}", &err),
+                );
 
-            result = match request {
-                Ok(req) => {
-                    match future::select(req, Delay::new(self.timeout)).await {
-                        Either::Left((Ok(mut resp), _)) => {
-                            match resp.body_json::<Vec<String>>().await {
-                                Ok(data) => {
-                                    if !data.contains(&intent.action().to_owned()) {
-                                        // Store the failure result into the cache
-                                        if let Some(cache) = cache {
-                                            let intent_ = intent.clone();
-                                            async_std::task::spawn_blocking(move || {
-                                                cache.set(&intent_.to_string(), false)
-                                            })
-                                            .await
-                                        }
+                let e: Error = ErrorKind::Internal(intent_err).into();
+                e
+            })?;
 
-                                        let intent_err = IntentError::new(
-                                            intent,
-                                            "the action forbidden by tenant",
-                                        );
+            result = match self.client.send_async(request).await {
+                Ok(mut response) => {
+                    let mut body = String::new();
+                    if let Err(e) = response.body_mut().read_to_string(&mut body).await {
+                        let intent_err = IntentError::new(
+                            intent_clone,
+                            format!(
+                                "Failed to read response body, err = {:?}, body read = {:?}",
+                                e, body
+                            ),
+                        );
 
-                                        return Err(ErrorKind::Forbidden(intent_err).into());
-                                    } else {
-                                        // Store the success result into the cache
-                                        if let Some(cache) = cache {
-                                            async_std::task::spawn_blocking(move || {
-                                                cache.set(&intent.to_string(), true)
-                                            })
-                                            .await
-                                        }
-                                        return Ok(());
-                                    }
+                        result = Err(ErrorKind::Network(intent_err).into());
+                        continue;
+                    }
+                    match serde_json::from_str::<Vec<String>>(&body) {
+                        Ok(data) => {
+                            if data.iter().all(|s| s != intent.action()) {
+                                // Store the failure result into the cache
+                                if let Some(cache) = cache {
+                                    let intent_ = intent.clone();
+                                    async_std::task::spawn_blocking(move || {
+                                        cache.set(&intent_.to_string(), false)
+                                    })
+                                    .await
                                 }
-                                Err(_) => {
-                                    let intent_err = IntentError::new(
-                                        intent_clone,
-                                        "invalid format of the authorization response",
-                                    );
 
-                                    Err(ErrorKind::Network(intent_err).into())
+                                let intent_err =
+                                    IntentError::new(intent, "the action forbidden by tenant");
+
+                                return Err(ErrorKind::Forbidden(intent_err).into());
+                            } else {
+                                // Store the success result into the cache
+                                if let Some(cache) = cache {
+                                    async_std::task::spawn_blocking(move || {
+                                        cache.set(&intent.to_string(), true)
+                                    })
+                                    .await
                                 }
+                                return Ok(());
                             }
                         }
-                        Either::Left((Err(err), _)) => {
+                        Err(e) => {
                             let intent_err = IntentError::new(
                                 intent_clone,
-                                &format!("error sending the authorization request, {}", &err),
-                            );
-
-                            Err(ErrorKind::Network(intent_err).into())
-                        }
-                        Either::Right((_, _)) => {
-                            let intent_err = IntentError::new(
-                                intent_clone,
-                                "timed out sending the authorization request",
+                                format!("invalid format of the authorization response, err = {:?}, body = {:?}", e, body),
                             );
 
                             Err(ErrorKind::Network(intent_err).into())
@@ -581,12 +605,18 @@ impl Authorize for HttpClient {
                     }
                 }
                 Err(err) => {
-                    let intent_err = IntentError::new(
-                        intent_clone,
-                        &format!("failed to build authorization request, {}", &err),
-                    );
+                    let intent_err = match err.kind() {
+                        HttpErrorKind::Timeout => IntentError::new(
+                            intent_clone,
+                            "timed out sending the authorization request",
+                        ),
+                        _ => IntentError::new(
+                            intent_clone,
+                            format!("error sending the authorization request, {:?}", err),
+                        ),
+                    };
 
-                    return Err(ErrorKind::Internal(intent_err).into());
+                    Err(ErrorKind::Network(intent_err).into())
                 }
             }
         }
@@ -637,7 +667,6 @@ impl<'a> HttpRequest<'a> {
         }
     }
 }
-
 #[derive(Debug, Serialize)]
 struct HttpSubject<'a> {
     namespace: &'a str,

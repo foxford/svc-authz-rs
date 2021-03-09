@@ -61,10 +61,10 @@ pub struct IntentError {
 impl StdError for IntentError {}
 
 impl IntentError {
-    pub(crate) fn new(intent: Intent, detail: &str) -> Self {
+    pub(crate) fn new<T: AsRef<str>>(intent: Intent, detail: T) -> Self {
         Self {
             intent,
-            detail: detail.to_owned(),
+            detail: detail.as_ref().to_owned(),
         }
     }
 }
