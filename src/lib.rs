@@ -78,7 +78,7 @@ trait IntoClient {
         me: &A,
         cache: Option<Box<dyn AuthzCache>>,
         audience: &str,
-        ban_f: BanCallback,
+        ban_f: Option<BanCallback>,
     ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable;
@@ -96,7 +96,7 @@ impl ClientMap {
         me: &A,
         cache: Option<Box<dyn AuthzCache>>,
         m: ConfigMap,
-        f: BanCallback,
+        f: Option<BanCallback>,
     ) -> Result<Self, ConfigurationError>
     where
         A: Authenticable,
@@ -187,7 +187,7 @@ impl IntoClient for NoneConfig {
         _me: &A,
         _cache: Option<Box<dyn AuthzCache>>,
         _audience: &str,
-        _ban_f: BanCallback,
+        _ban_f: Option<BanCallback>,
     ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
@@ -239,7 +239,7 @@ impl IntoClient for LocalConfig {
         _me: &A,
         _cache: Option<Box<dyn AuthzCache>>,
         _audience: &str,
-        _ban_f: BanCallback,
+        _ban_f: Option<BanCallback>,
     ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
@@ -332,7 +332,7 @@ impl IntoClient for HttpConfig {
         me: &A,
         cache: Option<Box<dyn AuthzCache>>,
         audience: &str,
-        ban_f: BanCallback,
+        ban_f: Option<BanCallback>,
     ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
@@ -406,7 +406,7 @@ struct HttpClient {
     authz_cache: Option<Box<dyn AuthzCache>>,
     user_agent: Option<String>,
     max_retries: usize,
-    ban_f: BanCallback,
+    ban_f: Option<BanCallback>,
 }
 
 impl std::fmt::Debug for HttpClient {
@@ -495,7 +495,10 @@ impl Authorize for HttpClient {
 
         let subject_ = subject.clone();
         if let Some(ban_key) = object.to_ban_key() {
-            let is_banned = (self.ban_f)(subject.to_owned(), object.clone()).await;
+            let is_banned = match &self.ban_f {
+                Some(ban_f) => (ban_f)(subject.to_owned(), object.clone()).await,
+                None => false,
+            };
 
             if let Some(ref cache) = self.authz_cache {
                 let cache = cache.clone();
@@ -735,7 +738,7 @@ impl IntoClient for LocalWhitelistConfig {
         _me: &A,
         _cache: Option<Box<dyn AuthzCache>>,
         _audience: &str,
-        ban_f: BanCallback,
+        ban_f: Option<BanCallback>,
     ) -> Result<Client, ConfigurationError>
     where
         A: Authenticable,
@@ -750,7 +753,7 @@ impl IntoClient for LocalWhitelistConfig {
 #[derive(Clone)]
 pub struct LocalWhitelistClient {
     records: Vec<LocalWhitelistRecord>,
-    ban_f: BanCallback,
+    ban_f: Option<BanCallback>,
 }
 
 impl fmt::Debug for LocalWhitelistClient {
@@ -773,7 +776,12 @@ impl Authorize for LocalWhitelistClient {
 
         match self.records.iter().find(|&r| r == &record) {
             Some(_) => {
-                if (self.ban_f)(subject, object.clone()).await {
+                let is_banned = match &self.ban_f {
+                    Some(ban_f) => (ban_f)(subject, object.clone()).await,
+                    None => false,
+                };
+
+                if is_banned {
                     let intent =
                         Intent::new(record.subject_account_id().clone(), object, record.action());
 
