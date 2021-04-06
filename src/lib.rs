@@ -425,22 +425,12 @@ impl std::fmt::Debug for HttpClient {
     }
 }
 
-#[async_trait]
-impl Authorize for HttpClient {
-    async fn authorize(
+impl HttpClient {
+    async fn check_cache(
         &self,
-        subject: AccountId,
-        object: Box<dyn IntentObject>,
-        action: String,
-    ) -> Result<(), Error> {
-        // Allow access if the subject in the trusted list
-        if let true = self.trusted.contains(&subject) {
-            return Ok(());
-        }
-
-        let intent = Intent::new(subject.clone(), object.clone(), &action);
-
-        // Return a result from the cache if available
+        intent: &Intent,
+        object: &Box<dyn IntentObject>,
+    ) -> Option<Result<(), Error>> {
         if let Some(ref cache) = self.authz_cache {
             let cache = cache.clone();
             let intent_ = intent.to_string();
@@ -453,21 +443,21 @@ impl Authorize for HttpClient {
 
                 match cache_response.get(0..2) {
                     Some([_, CacheResponse::Hit(true)]) => {
-                        return Err(ErrorKind::Forbidden(IntentError::new(
-                            intent,
+                        return Some(Err(ErrorKind::Forbidden(IntentError::new(
+                            intent.to_owned(),
                             "banned (cache hit)",
                         ))
-                        .into());
+                        .into()));
                     }
                     Some([CacheResponse::Hit(result), CacheResponse::Hit(false)]) => {
                         return if *result {
-                            Ok(())
+                            Some(Ok(()))
                         } else {
-                            Err(ErrorKind::Forbidden(IntentError::new(
-                                intent,
+                            Some(Err(ErrorKind::Forbidden(IntentError::new(
+                                intent.to_owned(),
                                 "the action forbidden by tenant (cache hit)",
                             ))
-                            .into())
+                            .into()))
                         };
                     }
                     Some([_, _]) => {}
@@ -481,19 +471,27 @@ impl Authorize for HttpClient {
 
                 if let CacheResponse::Hit(result) = cache_response {
                     return if result {
-                        Ok(())
+                        Some(Ok(()))
                     } else {
-                        Err(ErrorKind::Forbidden(IntentError::new(
-                            intent,
+                        Some(Err(ErrorKind::Forbidden(IntentError::new(
+                            intent.to_owned(),
                             "the action forbidden by tenant (cache hit)",
                         ))
-                        .into())
+                        .into()))
                     };
                 }
             }
         }
 
-        let subject_ = subject.clone();
+        None
+    }
+
+    async fn check_ban(
+        &self,
+        intent: &Intent,
+        object: &Box<dyn IntentObject>,
+        subject: &AccountId,
+    ) -> Option<Result<(), Error>> {
         if let Some(ban_key) = object.to_ban_key() {
             let is_banned = match &self.ban_f {
                 Some(ban_f) => (ban_f)(subject.to_owned(), object.clone()).await,
@@ -503,6 +501,7 @@ impl Authorize for HttpClient {
             if let Some(ref cache) = self.authz_cache {
                 let cache = cache.clone();
 
+                let subject_ = subject.clone();
                 async_std::task::spawn_blocking(move || {
                     let ban_key = format!("ban::{}::{}", subject_, ban_key.join("/"));
                     cache.set(&ban_key, is_banned);
@@ -511,18 +510,25 @@ impl Authorize for HttpClient {
             }
 
             if is_banned {
-                return Err(
-                    ErrorKind::Forbidden(IntentError::new(intent, "banned (cache hit)")).into(),
-                );
+                return Some(Err(ErrorKind::Forbidden(IntentError::new(
+                    intent.to_owned(),
+                    "banned (cache hit)",
+                ))
+                .into()));
             }
         }
 
-        let payload = HttpRequest::new(
-            HttpSubject::new(subject.audience(), subject.label()),
-            HttpObject::new(&self.object_ns, object.to_vec()),
-            &action,
-        );
+        None
+    }
 
+    async fn write_cache(&self, intent: &Intent, value: bool) {
+        if let Some(cache) = self.authz_cache.clone() {
+            let intent = intent.to_owned();
+            async_std::task::spawn_blocking(move || cache.set(&intent.to_string(), value)).await
+        }
+    }
+
+    async fn make_requests(&self, intent: &Intent, payload: &str) -> Result<(), Error> {
         let intent_err = IntentError::new(
             intent.clone(),
             "Not attempted to send the authorization request. Check out that max_retries > 0",
@@ -530,20 +536,8 @@ impl Authorize for HttpClient {
 
         let mut result = Err(ErrorKind::Internal(intent_err).into());
 
-        let cache = self.authz_cache.clone();
-
         for _ in 0..self.max_retries {
             let intent_clone = intent.clone();
-
-            let payload = serde_json::to_string(&payload).map_err(|err| {
-                let intent_err = IntentError::new(
-                    intent_clone.clone(),
-                    format!("Failed to serialize authorization request body, {}", &err),
-                );
-
-                let e: Error = ErrorKind::Internal(intent_err).into();
-                e
-            })?;
 
             let request = Request::post(&self.uri).body(payload).map_err(|err| {
                 let intent_err = IntentError::new(
@@ -574,33 +568,25 @@ impl Authorize for HttpClient {
                         Ok(data) => {
                             if data.iter().all(|s| s != intent.action()) {
                                 // Store the failure result into the cache
-                                if let Some(cache) = cache {
-                                    let intent_ = intent.clone();
-                                    async_std::task::spawn_blocking(move || {
-                                        cache.set(&intent_.to_string(), false)
-                                    })
-                                    .await
-                                }
+                                self.write_cache(&intent, false).await;
 
-                                let intent_err =
-                                    IntentError::new(intent, "the action forbidden by tenant");
+                                let intent_err = IntentError::new(
+                                    intent.to_owned(),
+                                    "the action forbidden by tenant",
+                                );
 
                                 return Err(ErrorKind::Forbidden(intent_err).into());
                             } else {
                                 // Store the success result into the cache
-                                if let Some(cache) = cache {
-                                    async_std::task::spawn_blocking(move || {
-                                        cache.set(&intent.to_string(), true)
-                                    })
-                                    .await
-                                }
+                                self.write_cache(&intent, true).await;
+
                                 return Ok(());
                             }
                         }
                         Err(e) => {
                             let intent_err = IntentError::new(
                                 intent_clone,
-                                format!("invalid format of the authorization response, err = {:?}, body = {:?}", e, body),
+                                format!("invalid format of the authorization response, err = {:?}, body = {}", e, body),
                             );
 
                             Err(ErrorKind::Network(intent_err).into())
@@ -625,6 +611,50 @@ impl Authorize for HttpClient {
         }
 
         result
+    }
+}
+
+#[async_trait]
+impl Authorize for HttpClient {
+    async fn authorize(
+        &self,
+        subject: AccountId,
+        object: Box<dyn IntentObject>,
+        action: String,
+    ) -> Result<(), Error> {
+        // Allow access if the subject in the trusted list
+        if let true = self.trusted.contains(&subject) {
+            return Ok(());
+        }
+
+        let intent = Intent::new(subject.clone(), object.clone(), &action);
+
+        // Return a result from the cache if available
+        if let Some(res) = self.check_cache(&intent, &object).await {
+            return res;
+        }
+
+        if let Some(res) = self.check_ban(&intent, &object, &subject).await {
+            return res;
+        }
+
+        let payload = HttpRequest::new(
+            HttpSubject::new(subject.audience(), subject.label()),
+            HttpObject::new(&self.object_ns, object.to_vec()),
+            &action,
+        );
+
+        let payload = serde_json::to_string(&payload).map_err(|err| {
+            let intent_err = IntentError::new(
+                intent.to_owned(),
+                format!("Failed to serialize authorization request body, {}", &err),
+            );
+
+            let e: Error = ErrorKind::Internal(intent_err).into();
+            e
+        })?;
+
+        self.make_requests(&intent, &payload).await
     }
 
     async fn ban(
