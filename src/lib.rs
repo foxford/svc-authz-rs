@@ -53,6 +53,8 @@ trait Authorize: Sync + Send {
         seconds: usize,
     ) -> Result<(), Error>;
 
+    fn http_proxy(&self) -> Option<HttpProxy>;
+
     fn box_clone(&self) -> Box<dyn Authorize>;
 }
 
@@ -174,6 +176,14 @@ impl ClientMap {
             Ok(())
         }
     }
+
+    pub fn http_proxy(&self, audience: &str) -> Option<HttpProxy> {
+        if let Some(client) = self.inner.get(audience) {
+            client.http_proxy()
+        } else {
+            None
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -222,6 +232,10 @@ impl Authorize for NoneClient {
 
     fn box_clone(&self) -> Box<dyn Authorize> {
         Box::new(self.clone())
+    }
+
+    fn http_proxy(&self) -> Option<HttpProxy> {
+        None
     }
 }
 
@@ -288,6 +302,10 @@ impl Authorize for LocalClient {
 
     fn box_clone(&self) -> Box<dyn Authorize> {
         Box::new(self.clone())
+    }
+
+    fn http_proxy(&self) -> Option<HttpProxy> {
+        None
     }
 }
 
@@ -679,6 +697,13 @@ impl Authorize for HttpClient {
         Ok(())
     }
 
+    fn http_proxy(&self) -> Option<HttpProxy> {
+        Some(HttpProxy {
+            client: self.client.clone(),
+            url: self.uri.clone(),
+        })
+    }
+
     fn box_clone(&self) -> Box<dyn Authorize> {
         Box::new(self.clone())
     }
@@ -843,6 +868,29 @@ impl Authorize for LocalWhitelistClient {
 
     fn box_clone(&self) -> Box<dyn Authorize> {
         Box::new(self.clone())
+    }
+
+    fn http_proxy(&self) -> Option<HttpProxy> {
+        None
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug, Clone)]
+pub struct HttpProxy {
+    client: Arc<isahc::HttpClient>,
+    url: String,
+}
+
+impl HttpProxy {
+    pub async fn send_async<T: Into<isahc::AsyncBody>>(
+        &self,
+        payload: T,
+    ) -> Result<isahc::Response<isahc::AsyncBody>, isahc::Error> {
+        let request = isahc::Request::post(&self.url).body(payload)?;
+
+        self.client.send_async(request).await
     }
 }
 
