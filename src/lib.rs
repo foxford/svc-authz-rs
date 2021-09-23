@@ -590,7 +590,7 @@ impl HttpClient {
                             Ok(data) => {
                                 if data.iter().all(|s| s != intent.action()) {
                                     // Store the failure result into the cache
-                                    self.write_cache(&intent, false).await;
+                                    self.write_cache(intent, false).await;
 
                                     let intent_err = IntentError::new(
                                         intent.to_owned(),
@@ -600,7 +600,7 @@ impl HttpClient {
                                     return Err(ErrorKind::Forbidden(intent_err).into());
                                 } else {
                                     // Store the success result into the cache
-                                    self.write_cache(&intent, true).await;
+                                    self.write_cache(intent, true).await;
 
                                     return Ok(());
                                 }
