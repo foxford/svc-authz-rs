@@ -459,6 +459,7 @@ impl std::fmt::Debug for HttpClient {
 }
 
 impl HttpClient {
+    #[allow(clippy::borrowed_box)]
     async fn check_cache(
         &self,
         intent: &Intent,
@@ -521,6 +522,7 @@ impl HttpClient {
         None
     }
 
+    #[allow(clippy::borrowed_box)]
     async fn check_ban(
         &self,
         intent: &Intent,
