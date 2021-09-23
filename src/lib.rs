@@ -14,12 +14,11 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use jsonwebtoken::Algorithm;
 use reqwest::{
-    header::{self, HeaderMap, HeaderName},
-    Body, Method, Request,
+    header::{self, HeaderMap},
+    Body,
 };
 use serde_derive::{Deserialize, Serialize};
 use svc_authn::{token::jws_compact, AccountId};
-use tokio::io::AsyncReadExt;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -542,7 +541,8 @@ impl HttpClient {
                     let ban_key = format!("ban::{}::{}", subject_, ban_key.join("/"));
                     cache.set(&ban_key, is_banned);
                 })
-                .await;
+                .await
+                .expect("Set panicked");
             }
 
             if is_banned {
@@ -584,7 +584,7 @@ impl HttpClient {
                 .send();
 
             result = match request.await {
-                Ok(mut response) => match response.text().await {
+                Ok(response) => match response.text().await {
                     Ok(body) => {
                         match serde_json::from_str::<Vec<String>>(&body) {
                             Ok(data) => {
