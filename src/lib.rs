@@ -1,19 +1,25 @@
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use async_std::prelude::*;
-use async_trait::async_trait;
-use chrono::{Duration, Utc};
-use isahc::{error::ErrorKind as HttpErrorKind, prelude::*, Request};
-use jsonwebtoken::Algorithm;
-use serde_derive::{Deserialize, Serialize};
-use svc_authn::{token::jws_compact, AccountId};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::TryInto,
+};
 
 use crate::cache::{AuthzCache, Response as CacheResponse};
 use crate::error::{ConfigurationError, IntentError};
 use crate::intent::Intent;
+use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::{Duration, Utc};
+use jsonwebtoken::Algorithm;
+use reqwest::{
+    header::{self, HeaderMap, HeaderName},
+    Body, Method, Request,
+};
+use serde_derive::{Deserialize, Serialize};
+use svc_authn::{token::jws_compact, AccountId};
+use tokio::io::AsyncReadExt;
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -375,31 +381,41 @@ impl IntoClient for HttpConfig {
 
         let timeout = std::time::Duration::from_secs(self.timeout.unwrap_or(5));
 
-        let builder = isahc::HttpClient::builder()
-            .timeout(timeout)
-            .default_header(
-                http_types::headers::AUTHORIZATION.as_str(),
-                format!("Bearer {}", token),
-            )
-            .default_header(
-                http_types::headers::CONTENT_TYPE.as_str(),
-                "application/json",
+        let mut default_haders = HeaderMap::new();
+        default_haders.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token)
+                .try_into()
+                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
+        );
+        default_haders.insert(
+            header::CONTENT_TYPE,
+            "application/json"
+                .try_into()
+                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
+        );
+        let builder = reqwest::Client::builder().timeout(timeout);
+        if let Some(ref user_agent) = self.user_agent {
+            default_haders.insert(
+                header::USER_AGENT,
+                user_agent
+                    .try_into()
+                    .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
             );
-        let builder = if let Some(ref user_agent) = self.user_agent {
-            builder.default_header(http_types::headers::USER_AGENT.as_str(), user_agent)
-        } else {
-            builder
         };
 
-        let client = builder.build().map_err(|err| {
-            ConfigurationError::new(&format!(
-                "error converting an authorization config for audience = '{}' into client, {}",
-                audience, &err,
-            ))
-        })?;
+        let client = builder
+            .default_headers(default_haders)
+            .build()
+            .map_err(|err| {
+                ConfigurationError::new(&format!(
+                    "error converting an authorization config for audience = '{}' into client, {}",
+                    audience, &err,
+                ))
+            })?;
 
         Ok(Box::new(HttpClient {
-            client: Arc::new(client),
+            client,
             object_ns: me.as_account_id().to_string(),
             uri: self.uri,
             timeout: std::time::Duration::from_secs(self.timeout.unwrap_or(5)),
@@ -415,7 +431,7 @@ impl IntoClient for HttpConfig {
 
 #[derive(Clone)]
 struct HttpClient {
-    client: Arc<isahc::HttpClient>,
+    client: reqwest::Client,
     object_ns: String,
     uri: String,
     timeout: std::time::Duration,
@@ -454,10 +470,11 @@ impl HttpClient {
             let intent_ = intent.to_string();
 
             if let Some(wildcard) = object.to_ban_key() {
-                let cache_response = async_std::task::spawn_blocking(move || {
+                let cache_response = tokio::task::spawn_blocking(move || {
                     cache.mget(&[&intent_, &wildcard.join("/")])
                 })
-                .await;
+                .await
+                .expect("Mget panicked");
 
                 match cache_response.get(0..2) {
                     Some([_, CacheResponse::Hit(true)]) => {
@@ -484,8 +501,9 @@ impl HttpClient {
                     }
                 }
             } else {
-                let cache_response =
-                    async_std::task::spawn_blocking(move || cache.get(&intent_)).await;
+                let cache_response = tokio::task::spawn_blocking(move || cache.get(&intent_))
+                    .await
+                    .expect("Get panicked");
 
                 if let CacheResponse::Hit(result) = cache_response {
                     return if result {
@@ -520,7 +538,7 @@ impl HttpClient {
                 let cache = cache.clone();
 
                 let subject_ = subject.clone();
-                async_std::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     let ban_key = format!("ban::{}::{}", subject_, ban_key.join("/"));
                     cache.set(&ban_key, is_banned);
                 })
@@ -542,7 +560,9 @@ impl HttpClient {
     async fn write_cache(&self, intent: &Intent, value: bool) {
         if let Some(cache) = self.authz_cache.clone() {
             let intent = intent.to_owned();
-            async_std::task::spawn_blocking(move || cache.set(&intent.to_string(), value)).await
+            tokio::task::spawn_blocking(move || cache.set(&intent.to_string(), value))
+                .await
+                .expect("Set panicked")
         }
     }
 
@@ -557,70 +577,65 @@ impl HttpClient {
         for _ in 0..self.max_retries {
             let intent_clone = intent.clone();
 
-            let request = Request::post(&self.uri).body(payload).map_err(|err| {
-                let intent_err = IntentError::new(
-                    intent_clone.clone(),
-                    format!("Failed to build authorization request, {}", &err),
-                );
+            let request = self
+                .client
+                .post(self.uri.clone())
+                .body(payload.to_owned())
+                .send();
 
-                let e: Error = ErrorKind::Internal(intent_err).into();
-                e
-            })?;
+            result = match request.await {
+                Ok(mut response) => match response.text().await {
+                    Ok(body) => {
+                        match serde_json::from_str::<Vec<String>>(&body) {
+                            Ok(data) => {
+                                if data.iter().all(|s| s != intent.action()) {
+                                    // Store the failure result into the cache
+                                    self.write_cache(&intent, false).await;
 
-            result = match self.client.send_async(request).await {
-                Ok(mut response) => {
-                    let mut body = String::new();
-                    if let Err(e) = response.body_mut().read_to_string(&mut body).await {
+                                    let intent_err = IntentError::new(
+                                        intent.to_owned(),
+                                        "the action forbidden by tenant",
+                                    );
+
+                                    return Err(ErrorKind::Forbidden(intent_err).into());
+                                } else {
+                                    // Store the success result into the cache
+                                    self.write_cache(&intent, true).await;
+
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                let intent_err = IntentError::new(
+                                    intent_clone,
+                                    format!("invalid format of the authorization response, err = {:?}, body = {}", e, body),
+                                );
+
+                                Err(ErrorKind::Network(intent_err).into())
+                            }
+                        }
+                    }
+                    Err(e) => {
                         let intent_err = IntentError::new(
                             intent_clone,
-                            format!(
-                                "Failed to read response body, err = {:?}, body read = {:?}",
-                                e, body
-                            ),
+                            format!("Failed to read response body, err = {:?}", e),
                         );
 
                         result = Err(ErrorKind::Network(intent_err).into());
                         continue;
                     }
-                    match serde_json::from_str::<Vec<String>>(&body) {
-                        Ok(data) => {
-                            if data.iter().all(|s| s != intent.action()) {
-                                // Store the failure result into the cache
-                                self.write_cache(&intent, false).await;
-
-                                let intent_err = IntentError::new(
-                                    intent.to_owned(),
-                                    "the action forbidden by tenant",
-                                );
-
-                                return Err(ErrorKind::Forbidden(intent_err).into());
-                            } else {
-                                // Store the success result into the cache
-                                self.write_cache(&intent, true).await;
-
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            let intent_err = IntentError::new(
-                                intent_clone,
-                                format!("invalid format of the authorization response, err = {:?}, body = {}", e, body),
-                            );
-
-                            Err(ErrorKind::Network(intent_err).into())
-                        }
-                    }
-                }
+                },
                 Err(err) => {
-                    let intent_err = match err.kind() {
-                        HttpErrorKind::Timeout => IntentError::new(
+                    let intent_err = if err.is_timeout() {
+                        IntentError::new(
                             intent_clone,
                             "timed out sending the authorization request",
-                        ),
-                        _ => IntentError::new(
+                        )
+                    } else {
+                        IntentError::new(
                             intent_clone,
                             format!("error sending the authorization request, {:?}", err),
-                        ),
+                        )
                     };
 
                     Err(ErrorKind::Network(intent_err).into())
@@ -687,7 +702,7 @@ impl Authorize for HttpClient {
             let ban_key = format!("ban::{}::{}", subject, object.to_vec().join("/"));
 
             async {
-                async_std::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     cache.set_ex(&ban_key, value, seconds);
                 })
                 .await
@@ -879,18 +894,19 @@ impl Authorize for LocalWhitelistClient {
 
 #[derive(Debug, Clone)]
 pub struct HttpProxy {
-    client: Arc<isahc::HttpClient>,
+    client: reqwest::Client,
     url: String,
 }
 
 impl HttpProxy {
-    pub async fn send_async<T: Into<isahc::AsyncBody>>(
-        &self,
-        payload: T,
-    ) -> Result<isahc::Response<isahc::AsyncBody>, isahc::Error> {
-        let request = isahc::Request::post(&self.url).body(payload)?;
-
-        self.client.send_async(request).await
+    pub async fn send_async<T: Into<Body>>(&self, payload: T) -> Result<Bytes, reqwest::Error> {
+        self.client
+            .post(self.url.clone())
+            .body(payload)
+            .send()
+            .await?
+            .bytes()
+            .await
     }
 }
 
