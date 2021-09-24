@@ -380,14 +380,14 @@ impl IntoClient for HttpConfig {
 
         let timeout = std::time::Duration::from_secs(self.timeout.unwrap_or(5));
 
-        let mut default_haders = HeaderMap::new();
-        default_haders.insert(
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
             header::AUTHORIZATION,
             format!("Bearer {}", token)
                 .try_into()
                 .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
         );
-        default_haders.insert(
+        default_headers.insert(
             header::CONTENT_TYPE,
             "application/json"
                 .try_into()
@@ -395,7 +395,7 @@ impl IntoClient for HttpConfig {
         );
         let builder = reqwest::Client::builder().timeout(timeout);
         if let Some(ref user_agent) = self.user_agent {
-            default_haders.insert(
+            default_headers.insert(
                 header::USER_AGENT,
                 user_agent
                     .try_into()
@@ -404,7 +404,7 @@ impl IntoClient for HttpConfig {
         };
 
         let client = builder
-            .default_headers(default_haders)
+            .default_headers(default_headers)
             .build()
             .map_err(|err| {
                 ConfigurationError::new(&format!(
