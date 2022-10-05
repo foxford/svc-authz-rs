@@ -768,7 +768,7 @@ impl<'a> HttpObject<'a> {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct LocalWhitelistRecord {
     subject_account_id: AccountId,
     object: Vec<String>,
