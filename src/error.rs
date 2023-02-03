@@ -26,7 +26,7 @@ impl StdError for Error {}
 
 impl Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let mut fun = |kind, inner| Display::fmt(&format!("[{}] {}", kind, inner), fmt);
+        let mut fun = |kind, inner| Display::fmt(&format!("[{kind}] {inner}"), fmt);
         match &self.kind {
             Kind::Forbidden(inner) => fun("Forbidden", inner),
             Kind::Network(inner) => fun("Network", inner),

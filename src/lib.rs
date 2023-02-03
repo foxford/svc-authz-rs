@@ -150,8 +150,7 @@ impl ClientMap {
             ErrorKind::Forbidden(IntentError::new(
                 Intent::new(subject.as_account_id().clone(), object.clone(), &action),
                 format!(
-                    "no authorization configuration for the audience = {}",
-                    audience
+                    "no authorization configuration for the audience = {audience}"
                 ),
             ))
         })?;
@@ -383,15 +382,15 @@ impl IntoClient for HttpConfig {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
             header::AUTHORIZATION,
-            format!("Bearer {}", token)
+            format!("Bearer {token}")
                 .try_into()
-                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
+                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {e}")))?,
         );
         default_headers.insert(
             header::CONTENT_TYPE,
             "application/json"
                 .try_into()
-                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
+                .map_err(|e| ConfigurationError::new(&format!("Bad header value: {e}")))?,
         );
         let builder = reqwest::Client::builder().timeout(timeout);
         if let Some(ref user_agent) = self.user_agent {
@@ -399,7 +398,7 @@ impl IntoClient for HttpConfig {
                 header::USER_AGENT,
                 user_agent
                     .try_into()
-                    .map_err(|e| ConfigurationError::new(&format!("Bad header value: {}", e)))?,
+                    .map_err(|e| ConfigurationError::new(&format!("Bad header value: {e}")))?,
             );
         };
 
@@ -610,7 +609,7 @@ impl HttpClient {
                             Err(e) => {
                                 let intent_err = IntentError::new(
                                     intent_clone,
-                                    format!("invalid format of the authorization response, err = {:?}, body = {}", e, body),
+                                    format!("invalid format of the authorization response, err = {e:?}, body = {body}"),
                                 );
 
                                 Err(ErrorKind::Network(intent_err).into())
@@ -620,7 +619,7 @@ impl HttpClient {
                     Err(e) => {
                         let intent_err = IntentError::new(
                             intent_clone,
-                            format!("Failed to read response body, err = {:?}", e),
+                            format!("Failed to read response body, err = {e:?}"),
                         );
 
                         result = Err(ErrorKind::Network(intent_err).into());
@@ -636,7 +635,7 @@ impl HttpClient {
                     } else {
                         IntentError::new(
                             intent_clone,
-                            format!("error sending the authorization request, {:?}", err),
+                            format!("error sending the authorization request, {err:?}"),
                         )
                     };
 
