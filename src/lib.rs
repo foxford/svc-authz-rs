@@ -48,7 +48,7 @@ trait Authorize: Sync + Send {
         subject: AccountId,
         object: Box<dyn IntentObject>,
         action: String,
-    ) -> Result<(), Error>;
+    ) -> Result<Vec<String>, Error>;
 
     async fn ban(
         &self,
@@ -140,7 +140,7 @@ impl ClientMap {
         subject: A,
         object: Box<dyn IntentObject>,
         action: String,
-    ) -> Result<Duration, Error>
+    ) -> Result<(Vec<String>, Duration), Error>
     where
         A: Authenticable,
     {
@@ -159,7 +159,7 @@ impl ClientMap {
         client
             .authorize(subject.as_account_id().to_owned(), object, action)
             .await
-            .map(|()| Utc::now() - start_time)
+            .map(|response| (response, Utc::now() - start_time))
     }
 
     pub async fn ban<A>(
@@ -220,9 +220,9 @@ impl Authorize for NoneClient {
         &self,
         _subject: AccountId,
         _object: Box<dyn IntentObject>,
-        _action: String,
-    ) -> Result<(), Error> {
-        Ok(())
+        action: String,
+    ) -> Result<Vec<String>, Error> {
+        Ok(vec![action])
     }
 
     async fn ban(
@@ -281,10 +281,10 @@ impl Authorize for LocalClient {
         subject: AccountId,
         object: Box<dyn IntentObject>,
         action: String,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<String>, Error> {
         // Allow access if the subject in the trusted list
         if self.trusted.contains(&subject) {
-            Ok(())
+            Ok(vec![action])
         } else {
             let intent_err = IntentError::new(
                 Intent::new(subject, object, &action),
@@ -568,7 +568,7 @@ impl HttpClient {
         }
     }
 
-    async fn make_requests(&self, intent: &Intent, payload: &str) -> Result<(), Error> {
+    async fn make_requests(&self, intent: &Intent, payload: &str) -> Result<Vec<String>, Error> {
         let intent_err = IntentError::new(
             intent.clone(),
             "Not attempted to send the authorization request. Check out that max_retries > 0",
@@ -604,7 +604,7 @@ impl HttpClient {
                                     // Store the success result into the cache
                                     self.write_cache(intent, true).await;
 
-                                    return Ok(());
+                                    return Ok(data);
                                 }
                             }
                             Err(e) => {
@@ -656,21 +656,21 @@ impl Authorize for HttpClient {
         subject: AccountId,
         object: Box<dyn IntentObject>,
         action: String,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<String>, Error> {
         // Allow access if the subject in the trusted list
         if let true = self.trusted.contains(&subject) {
-            return Ok(());
+            return Ok(vec![action]);
         }
 
         let intent = Intent::new(subject.clone(), object.clone(), &action);
 
         // Return a result from the cache if available
         if let Some(res) = self.check_cache(&intent, &object).await {
-            return res;
+            return res.map(|_| vec![action]);
         }
 
         if let Some(res) = self.check_ban(&intent, &object, &subject).await {
-            return res;
+            return res.map(|_| vec![action]);
         }
 
         let payload = HttpRequest::new(
@@ -843,7 +843,7 @@ impl Authorize for LocalWhitelistClient {
         subject: AccountId,
         object: Box<dyn IntentObject>,
         action: String,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<String>, Error> {
         let record = LocalWhitelistRecord::new(&subject, object.clone(), &action);
 
         match self.records.iter().find(|&r| r == &record) {
@@ -860,7 +860,7 @@ impl Authorize for LocalWhitelistClient {
                     let err = ErrorKind::Forbidden(IntentError::new(intent, "Banned"));
                     Err(err.into())
                 } else {
-                    Ok(())
+                    Ok(vec![action])
                 }
             }
             None => {
