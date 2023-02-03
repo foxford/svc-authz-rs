@@ -149,9 +149,7 @@ impl ClientMap {
         let client = self.inner.get(&audience).ok_or_else(|| {
             ErrorKind::Forbidden(IntentError::new(
                 Intent::new(subject.as_account_id().clone(), object.clone(), &action),
-                format!(
-                    "no authorization configuration for the audience = {audience}"
-                ),
+                format!("no authorization configuration for the audience = {audience}"),
             ))
         })?;
 
